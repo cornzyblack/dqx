@@ -31,8 +31,6 @@ def is_valid_ipv6_address(column: str | Column) -> pd.Series:
         "Sample or limit large datasets when running IPV6 address validation.",
     )
 
-    _validate_environment("is_valid_ipv6_address")
-
     col_str_norm, col_expr_str, col_expr = _get_normalized_column_and_expr(column)
 
     is_valid_ipv6_address_udf = _build_is_valid_ipv6_address_udf()
@@ -70,8 +68,6 @@ def is_ipv6_address_in_cidr(column: str | Column, cidr_block: str) -> Column:
 
     if not _is_valid_cidr_block(cidr_block):
         raise ValueError(f"CIDR block '{cidr_block}' is not a valid IPv6 CIDR block.")
-
-    _validate_environment("is_ipv6_address_in_cidr")
 
     col_str_norm, col_expr_str, col_expr = _get_normalized_column_and_expr(column)
     cidr_lit = F.lit(cidr_block)

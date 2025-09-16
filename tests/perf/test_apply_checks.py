@@ -4,6 +4,7 @@ from databricks.labs.dqx.rule import DQRowRule, DQDatasetRule, DQForEachColRule
 from databricks.labs.dqx.config import ExtraParams
 import pytest
 from databricks.labs.dqx import check_funcs
+from databricks.labs.dqx.ipaddress import ipaddress_funcs as ipmodule
 from tests.perf.conftest import DEFAULT_ROWS
 
 RUN_TIME = datetime(2025, 1, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
@@ -1286,4 +1287,64 @@ def test_benchmark_foreach_is_data_fresh_per_time_window(benchmark, ws, generate
     ]
     benchmark.group += f"_{n_rows}_rows_{len(columns)}_columns"
     actual_count = benchmark(lambda: dq_engine.apply_checks(df, checks).count())
+    assert actual_count == EXPECTED_ROWS
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "col1_ipv6_u_upper",
+        "col2_ipv6_u_lower",
+        "col3_ipv6_c_min1",
+        "col4_ipv6_c_r3",
+        "col5_ipv6_c_l3",
+        "col6_ipv6_c_mid1",
+        "col7_ipv6_c_mid4",
+        "col8_ipv6_u_prefix",
+    ],
+)
+@pytest.mark.benchmark(group="test_benchmark_is_valid_ipv6_address.previous")
+def test_benchmark_prev_is_valid_ipv6_address(benchmark, ws, generated_ipv6_df, column):
+    dq_engine = DQEngine(workspace_client=ws, extra_params=EXTRA_PARAMS)
+    checks = [
+        DQRowRule(
+            name=f"{column}_prev_is_valid_ipv6_address",
+            criticality="warn",
+            check_func=check_funcs.is_valid_ipv6_address,
+            column=column,
+        ),
+    ]
+    benchmark.group += f" {column}"
+    checked = dq_engine.apply_checks(generated_ipv6_df, checks)
+    actual_count = benchmark(lambda: checked.count())
+    assert actual_count == EXPECTED_ROWS
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "col1_ipv6_u_upper",
+        "col2_ipv6_u_lower",
+        "col3_ipv6_c_min1",
+        "col4_ipv6_c_r3",
+        "col5_ipv6_c_l3",
+        "col6_ipv6_c_mid1",
+        "col7_ipv6_c_mid4",
+        "col8_ipv6_u_prefix",
+    ],
+)
+@pytest.mark.benchmark(group="test_benchmark_is_valid_ipv6_address.current")
+def test_benchmark_current_is_valid_ipv6_address(benchmark, ws, generated_ipv6_df, column):
+    dq_engine = DQEngine(workspace_client=ws, extra_params=EXTRA_PARAMS)
+    checks = [
+        DQRowRule(
+            name=f"{column}_current_is_valid_ipv6_address",
+            criticality="warn",
+            check_func=ipmodule.is_valid_ipv6_address,
+            column=column,
+        ),
+    ]
+    benchmark.group += f" {column}"
+    checked = dq_engine.apply_checks(generated_ipv6_df, checks)
+    actual_count = benchmark(lambda: checked.count())
     assert actual_count == EXPECTED_ROWS

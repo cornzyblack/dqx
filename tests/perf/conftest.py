@@ -188,3 +188,31 @@ def generated_timestamp_df(request, spark):
     for col in col_names:
         data_gen = data_gen.withColumn(col, "timestamp", begin=begin, end=end, interval=interval, **opts)
     return col_names, data_gen.build(), n_rows
+
+
+@pytest.fixture
+def generated_ipv6_df(spark, rows=DEFAULT_ROWS):
+    IPV6_SCHEMA_STR = (
+        "col1_ipv6_u_upper: string, "
+        "col2_ipv6_u_lower: string, "
+        "col3_ipv6_c_min1: string, "
+        "col4_ipv6_c_r3: string, "
+        "col5_ipv6_c_l3: string, "
+        "col6_ipv6_c_mid1: string, "
+        "col7_ipv6_c_mid4: string, "
+        "col8_ipv6_u_prefix: string"
+    )
+    schema = _parse_datatype_string(IPV6_SCHEMA_STR)
+    spec = (
+        dg.DataGenerator(spark, rows=DEFAULT_ROWS, partitions=DEFAULT_PARTITIONS)
+        .withSchema(schema)
+        .withColumnSpec("col1_ipv6_u_upper", template=r'XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX')
+        .withColumnSpec("col2_ipv6_u_lower", template=r'xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx')
+        .withColumnSpec("col3_ipv6_c_min1", template='::')
+        .withColumnSpec("col4_ipv6_c_r3", template='::XXXX:XXXX:XXXX')
+        .withColumnSpec("col5_ipv6_c_l3", template='XXXX:XXXX:XXXX::')
+        .withColumnSpec("col6_ipv6_c_mid1", template='XXXX::XXXX')
+        .withColumnSpec("col7_ipv6_c_mid4", template='XXXX:XXXX::XXXX')
+        .withColumnSpec("col8_ipv6_u_prefix", template='2001:0DB8:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX')
+    )
+    return spec.build()
