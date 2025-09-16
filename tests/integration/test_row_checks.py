@@ -26,9 +26,10 @@ from databricks.labs.dqx.check_funcs import (
     is_valid_timestamp,
     is_valid_ipv4_address,
     is_ipv4_address_in_cidr,
+    is_valid_ipv6_address,
+    is_ipv6_address_in_cidr,
     is_data_fresh,
 )
-from databricks.labs.dqx.ipaddress import ipaddress_funcs
 from databricks.labs.dqx.pii import pii_detection_funcs
 
 SCHEMA = "a: string, b: int"
@@ -1584,22 +1585,21 @@ def test_ipv4_address_cidr_edge_cases(spark):
     )
 
     actual = test_df.select(
-        # Test various prefix lengths
-        is_ipv4_address_in_cidr("a", "192.168.1.1/32"),  # Single host
-        is_ipv4_address_in_cidr("a", "0.0.0.0/0"),  # Universal range
-        is_ipv4_address_in_cidr("a", "10.0.0.0/8"),  # Class A
-        is_ipv4_address_in_cidr("a", "172.16.0.0/12"),  # Class B
-        is_ipv4_address_in_cidr("a", "192.168.0.0/16"),  # Class C range
-        is_ipv4_address_in_cidr("a", "224.0.0.0/4"),  # Multicast
+        is_ipv4_address_in_cidr("a", "192.168.1.1/32").alias("a_is_not_ipv4_in_cidr_192_168_1_1_32"),  # Single host
+        is_ipv4_address_in_cidr("a", "0.0.0.0/0").alias("a_is_not_ipv4_in_cidr_0_0_0_0_0"),  # Universal range
+        is_ipv4_address_in_cidr("a", "10.0.0.0/8").alias("a_is_not_ipv4_in_cidr_10_0_0_0_8"),  # Class A
+        is_ipv4_address_in_cidr("a", "172.16.0.0/12").alias("a_is_not_ipv4_in_cidr_172_16_0_0_12"),  # Class B
+        is_ipv4_address_in_cidr("a", "192.168.0.0/16").alias("a_is_not_ipv4_in_cidr_192_168_0_0_16"),  # Class C range
+        is_ipv4_address_in_cidr("a", "224.0.0.0/4").alias("a_is_not_ipv4_in_cidr_224_0_0_0_4"),  # Multicast
     )
 
     checked_schema = (
-        "a_is_not_ipv4_in_cidr: string, "
-        "a_is_not_ipv4_in_cidr: string, "
-        "a_is_not_ipv4_in_cidr: string, "
-        "a_is_not_ipv4_in_cidr: string, "
-        "a_is_not_ipv4_in_cidr: string, "
-        "a_is_not_ipv4_in_cidr: string"
+        "a_is_not_ipv4_in_cidr_192_168_1_1_32: string, "
+        "a_is_not_ipv4_in_cidr_0_0_0_0_0: string, "
+        "a_is_not_ipv4_in_cidr_10_0_0_0_8: string, "
+        "a_is_not_ipv4_in_cidr_172_16_0_0_12: string, "
+        "a_is_not_ipv4_in_cidr_192_168_0_0_16: string, "
+        "a_is_not_ipv4_in_cidr_224_0_0_0_4: string"
     )
 
     expected = spark.createDataFrame(
@@ -1807,7 +1807,7 @@ def test_is_valid_ipv6_address_fails_session_validation(spark):
     with pytest.raises(
         ImportError, match="'is_valid_ipv6_address' is not supported when running checks with Databricks Connect"
     ):
-        test_df.select(ipaddress_funcs.is_valid_ipv6_address("a"), ipaddress_funcs.is_valid_ipv6_address("b"))
+        test_df.select(is_valid_ipv6_address("a"), is_valid_ipv6_address("b"))
 
 
 def test_is_ipv6_cidr_fails_session_validation(spark):
@@ -1823,7 +1823,7 @@ def test_is_ipv6_cidr_fails_session_validation(spark):
     with pytest.raises(
         ImportError, match="'is_ipv6_address_in_cidr' is not supported when running checks with Databricks Connect"
     ):
-        test_df.select(ipaddress_funcs.is_ipv6_address_in_cidr("a", "2001:db8:abcd:0012::0/72"))
+        test_df.select(is_ipv6_address_in_cidr("a", "2001:db8:abcd:0012::0/72"))
 
 
 def test_is_data_fresh(spark, set_utc_timezone):
