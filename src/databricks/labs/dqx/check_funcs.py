@@ -1853,12 +1853,18 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     base_conformity = ~is_invalid_json & is_not_corrupt
 
     if strict:
+        keys = F.map_keys(parsed_struct)
+        map_json = F.from_json(col_expr, types.MapType(types.StringType(), types.StringType()))
+        keys = F.map_keys(map_json)
+        expected_fields = [F.lit(f.name) for f in _expected_schema.fields]
+        has_extra_fields = F.size(F.array_except(keys, F.array(*expected_fields))) > 0
+
         exprs = (_generate_not_null_expr(_expected_schema, parsed_struct))
         does_not_have_content = F.array_contains(
             F.array(*[F.coalesce(e, F.lit(False)) for e in exprs]),
             False
         )
-        is_conforming = base_conformity & ~does_not_have_content
+        is_conforming = base_conformity & ~has_extra_fields & ~does_not_have_content
     else:
         is_conforming = base_conformity
 
@@ -2813,6 +2819,16 @@ def _validate_sql_query_params(query: str, merge_columns: list[str]) -> None:
 
 
 def _generate_not_null_expr(schema: types.StructType, col_name: Column) -> list[Column]:
+    """
+    Generate a list of expressions that check for non-null values in the given schema.
+
+    Args:
+        schema: The schema of the DataFrame.
+        col_name: The name of the column to check.
+
+    Returns:
+        A list of Column expressions that check for non-null values.
+    """
     exprs = []
     for field in schema.fields:
         field_col = col_name[field.name]
@@ -2821,3 +2837,21 @@ def _generate_not_null_expr(schema: types.StructType, col_name: Column) -> list[
         else:
             exprs.append(field_col.isNotNull())
     return exprs
+
+def has_extra_keys(json_col: Column, schema: types.StructType) -> Column:
+    # Parse current level as a map
+    json_map = F.from_json(json_col, types.MapType(types.StringType(), types.StringType()))
+    current_keys = F.map_keys(json_map)
+    expected_keys = F.array(*[F.lit(f.name) for f in schema.fields])
+    has_extra = F.size(F.array_except(current_keys, expected_keys)) > 0
+
+    # Recurse into nested structs
+    nested_checks = []
+    for f in schema.fields:
+        if isinstance(f.dataType, types.StructType):
+            nested_checks.append(has_extra_keys(json_map[f.name], f.dataType))
+
+    if nested_checks:
+        nested_expr = reduce(lambda a, b: a | b, nested_checks)
+        return has_extra | nested_expr
+    return has_extra
