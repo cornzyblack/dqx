@@ -1860,7 +1860,7 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     base_conformity = ~is_invalid_json & is_not_corrupt
 
     if strict:
-        map_json = F.from_json(col_expr, types.MapType(types.StringType(), types.StringType()))
+        map_json = F.from_json(col_expr, _expected_schema)
         json_keys = F.map_keys(map_json)
         expected_keys = [F.lit(f.name) for f in _expected_schema.fields]
 
