@@ -1853,7 +1853,7 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     base_conformity = ~is_invalid_json & is_not_corrupt
 
     if strict:
-        condition_str = " AND ".join(_generate_not_null_expr(_expected_schema, col_expr_str))
+        condition_str = " AND ".join(_generate_not_null_expr(_expected_schema, parsed_struct))
         has_content = F.expr(condition_str)
         is_conforming = base_conformity & has_content
     else:
@@ -2809,12 +2809,12 @@ def _validate_sql_query_params(query: str, merge_columns: list[str]) -> None:
         )
 
 
-def _generate_not_null_expr(schema: types.StructType, col_name: str) -> list[str]:
+def _generate_not_null_expr(schema: types.StructType, col_name: Column) -> list[Column]:
     exprs = []
     for field in schema.fields:
-        field_path = f"{col_name}.{field.name}"
+        field_col = col_name[field.name]
         if isinstance(field.dataType, types.StructType):
-            exprs += _generate_not_null_expr(field.dataType, col_name=field_path)
+            exprs += _generate_not_null_expr(field.dataType, field_col)
         else:
-            exprs.append(f"{field_path} IS NOT NULL")
+            exprs.append(field_col.isNotNull())
     return exprs
