@@ -1856,8 +1856,6 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
         exprs = (_generate_not_null_expr(_expected_schema, parsed_struct))
         has_content = F.bool_and(
             F.array(*[F.coalesce(e, F.lit(False)) for e in exprs]),
-            F.lit(True),
-            lambda acc, x: acc & x
         )
         is_conforming = base_conformity & has_content
     else:
