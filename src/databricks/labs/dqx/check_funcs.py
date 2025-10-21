@@ -1822,15 +1822,13 @@ def has_json_keys(column: str | Column, keys: list[str], require_all: bool = Tru
 
 
 @register_rule("row")
-def has_valid_json_schema(column: str | Column, schema: str | types.StructType, strict: bool = False) -> Column:
+def has_valid_json_schema(column: str | Column, schema: str | types.StructType) -> Column:
     """
     Checks whether the values in the input column conform to a specified JSON schema.
 
     Args:
         column: The name of the column or the column expression to check for JSON schema conformity.
         schema: The expected JSON schema as a DDL string (e.g., "id INT, name STRING") or StructType object.
-        strict: Whether to perform strict schema validation. In strict mode, the JSON must match the schema
-                exactly (no extra fields, all required fields present). Non-strict mode allows extra fields.
 
     Returns:
         Column: A Spark Column indicating schema validity; False if violations are found.
@@ -1838,11 +1836,9 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     _expected_schema = _get_schema(schema)
     col_str_norm, col_expr_str, col_expr = _get_normalized_column_and_expr(column)
 
-    # Check JSON string validity first
     json_validation_error = is_valid_json(col_str_norm)
     is_invalid_json = json_validation_error.isNotNull()
 
-    # Use a unique corrupt record field to detect parse issues
     unique_prefix = uuid.uuid4().hex[:8]
     corrupt_record_name = f"{unique_prefix}_dqx_corrupt_record"
 
@@ -1860,29 +1856,17 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     base_conformity = ~is_invalid_json & is_not_corrupt
     schema_str = _expected_schema.simpleString()
 
+    not_null_checks = _generate_field_presence_checks(_expected_schema, parsed_struct)
+    has_null_fields = F.array_contains(F.array(*[F.coalesce(e, F.lit(False)) for e in not_null_checks]), False)
 
-    def _normalize_schema_str(col):
-        return F.lower(F.regexp_replace(col, r"\s+", ""))  # remove spaces, lowercase everything
-
-    if not strict:
-        not_null_checks = _generate_field_presence_checks(_expected_schema, parsed_struct)
-        has_null_fields = F.array_contains(F.array(*[F.coalesce(e, F.lit(False)) for e in not_null_checks]), False)
-
-        is_conforming = base_conformity & ~has_null_fields
-
-    else:
-        is_conforming = base_conformity & (
-            _normalize_schema_str(F.schema_of_json(
-            F.from_json(col_expr, _expected_schema).alias("test")
-            )
-        ) == _normalize_schema_str(F.lit(schema_str)))
+    is_conforming = base_conformity & ~has_null_fields
 
     condition = is_conforming | col_expr.isNull()
     error_msg = F.concat_ws(
         "",
         F.lit("Value '"),
         F.when(col_expr.isNull(), F.lit("null")).otherwise(col_expr.cast("string")),
-        F.lit(f"' in Column '{col_expr_str}' does not conform to expected JSON schema (strict={strict}): "),
+        F.lit(f"' in Column '{col_expr_str}' does not conform to expected JSON schema"),
         F.lit(schema_str),
     )
     final_error_msg = F.when(is_invalid_json, json_validation_error).otherwise(error_msg)
