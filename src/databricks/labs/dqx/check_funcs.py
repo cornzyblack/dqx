@@ -1938,7 +1938,7 @@ def _get_strict_schema_comparison(actual_schema: types.StructType, expected_sche
     """
 
     errors = []
-
+    print(type(actual_schema), actual_schema)
     if actual_schema == expected_schema:
         return []
 
