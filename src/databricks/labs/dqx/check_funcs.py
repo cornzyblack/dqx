@@ -1841,7 +1841,6 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     json_validation_error = is_valid_json(col_str_norm)
     is_invalid_json = json_validation_error.isNotNull()
 
-    # Add this because of to avoid name clashes if a user already specified _corrupt_record field
     unique_prefix = uuid.uuid4().hex[:8]
     corrupt_record_name = f"{unique_prefix}_dqx_corrupt_record"
     new_json_schema = types.StructType(
@@ -1854,8 +1853,7 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     base_conformity = ~is_invalid_json & is_not_corrupt
 
     if strict:
-        parsed_col_name = f"{unique_prefix}_parsed_json"
-        condition_str = " AND ".join(_generate_not_null_expr(_expected_schema, parsed_col_name))
+        condition_str = " AND ".join(_generate_not_null_expr(_expected_schema, col_expr_str))
         has_content = F.expr(condition_str)
         is_conforming = base_conformity & has_content
     else:
