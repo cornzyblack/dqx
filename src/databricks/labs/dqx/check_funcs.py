@@ -1822,7 +1822,6 @@ def has_json_keys(column: str | Column, keys: list[str], require_all: bool = Tru
 
 
 @register_rule("row")
-@register_rule("row")
 def has_valid_json_schema(column: str | Column, schema: str | types.StructType, strict: bool = False) -> Column:
     """
     Checks whether the values in the input column conform to a specified JSON schema.
@@ -2842,22 +2841,3 @@ def _generate_not_null_expr(schema: types.StructType, col_name: Column) -> list[
         else:
             exprs.append(field_col.isNotNull())
     return exprs
-
-
-def has_extra_keys(json_col: Column, schema: types.StructType) -> Column:
-    # Parse current level as a map
-    json_map = F.from_json(json_col, types.MapType(types.StringType(), types.StringType()))
-    current_keys = F.map_keys(json_map)
-    expected_keys = F.array(*[F.lit(f.name) for f in schema.fields])
-    has_extra = F.size(F.array_except(current_keys, expected_keys)) > 0
-
-    # Recurse into nested structs
-    nested_checks = []
-    for f in schema.fields:
-        if isinstance(f.dataType, types.StructType):
-            nested_checks.append(has_extra_keys(json_map[f.name], f.dataType))
-
-    if nested_checks:
-        nested_expr = reduce(lambda a, b: a | b, nested_checks)
-        return has_extra | nested_expr
-    return has_extra
