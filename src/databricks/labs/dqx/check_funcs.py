@@ -1870,7 +1870,8 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
 
         is_conforming = base_conformity & ~has_extra_fields & ~has_null_fields
     else:
-        is_conforming = base_conformity
+        is_conforming = base_conformity & F.size(F.json_object_keys(col_expr)) > 0
+
 
     condition = is_conforming | col_expr.isNull()
     schema_str = _expected_schema.simpleString()
