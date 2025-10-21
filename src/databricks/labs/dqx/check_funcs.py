@@ -1858,18 +1858,22 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
 
     is_not_corrupt = parsed_struct[corrupt_record_name].isNull()
     base_conformity = ~is_invalid_json & is_not_corrupt
+    schema_str = _expected_schema.simpleString()
+
+
+    def _normalize_schema_str(col):
+        return F.lower(F.regexp_replace(col, r"\s+", ""))  # remove spaces, lowercase everything
 
     if not strict:
-        not_null_checks = _generate_not_null_expr(_expected_schema, parsed_struct)
+        not_null_checks = _generate_field_presence_checks(_expected_schema, parsed_struct)
         has_null_fields = F.array_contains(F.array(*[F.coalesce(e, F.lit(False)) for e in not_null_checks]), False)
 
         is_conforming = base_conformity & ~has_null_fields
 
     else:
-        is_conforming = base_conformity
+        is_conforming = base_conformity & (_normalize_schema_str(F.schema_of_json(F.from_json(col_expr, _expected_schema))) == _normalize_schema_str(F.lit(schema_str)))
 
     condition = is_conforming | col_expr.isNull()
-    schema_str = _expected_schema.simpleString()
     error_msg = F.concat_ws(
         "",
         F.lit("Value '"),
@@ -2818,22 +2822,24 @@ def _validate_sql_query_params(query: str, merge_columns: list[str]) -> None:
         )
 
 
-def _generate_not_null_expr(schema: types.StructType, col_name: Column) -> list[Column]:
+def _generate_field_presence_checks(expected_schema: types.StructType, parsed_struct_col: Column) -> list[Column]:
     """
-    Generate a list of expressions that check for non-null values in the given schema.
+    Recursively generate Spark Column expressions that verify each field defined in the expected
+    schema is present and non-null within a parsed struct column.
 
     Args:
-        schema: The expected schema.
-        col_name: The name of the column to check.
+        expected_schema: The StructType defining the expected JSON schema.
+        parsed_struct_col: The parsed struct column (e.g., from from_json) to validate.
 
     Returns:
-        A list of Column expressions that check for non-null values.
+        A list of Column expressions, one per field in the expected schema, that evaluate to True
+        if the corresponding field is non-null.
     """
-    exprs = []
-    for field in schema.fields:
-        field_col = col_name[field.name]
+    checks = []
+    for field in expected_schema.fields:
+        field_ref = parsed_struct_col[field.name]
         if isinstance(field.dataType, types.StructType):
-            exprs += _generate_not_null_expr(field.dataType, field_col)
+            checks += _generate_field_presence_checks(field.dataType, field_ref)
         else:
-            exprs.append(field_col.isNotNull())
-    return exprs
+            checks.append(field_ref.isNotNull())
+    return checks
