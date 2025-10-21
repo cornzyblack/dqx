@@ -1860,11 +1860,8 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     base_conformity = ~is_invalid_json & is_not_corrupt
 
     if strict:
-        map_json = F.from_json(col_expr, _expected_schema)
-        json_keys = F.map_keys(map_json)
-        expected_keys = [F.lit(f.name) for f in _expected_schema.fields]
-
-        has_extra_fields = F.size(F.array_except(json_keys, F.array(*expected_keys))) > 0
+        variant_col = F.from_json(col_expr, types.VariantType())
+        has_extra_fields = _extra_fields_variant(variant_col, _expected_schema)
         not_null_checks = _generate_not_null_expr(_expected_schema, parsed_struct)
         has_null_fields = F.array_contains(F.array(*[F.coalesce(e, F.lit(False)) for e in not_null_checks]), False)
 
@@ -2842,3 +2839,32 @@ def _generate_not_null_expr(schema: types.StructType, col_name: Column) -> list[
         else:
             exprs.append(field_col.isNotNull())
     return exprs
+
+from functools import reduce
+
+def _extra_fields_variant(variant_col: F.Column, schema: types.StructType, path: str = "$") -> F.Column:
+    """
+    Recursively check for extra fields inside a VARIANT column.
+    Returns a boolean Column indicating whether any extra keys exist.
+    """
+    # Expected keys at this level
+    expected_keys = [F.lit(f.name) for f in schema.fields]
+
+    # Get actual JSON keys at this level (Variant supports keys(path))
+    actual_keys = F.keys(variant_col, path)
+
+    # Detect extra keys at this level
+    has_extra_here = F.size(F.array_except(actual_keys, F.array(*expected_keys))) > 0
+
+    # Recursively check nested structs
+    nested_checks = []
+    for f in schema.fields:
+        if isinstance(f.dataType, types.StructType):
+            subpath = f"{path}.{f.name}"
+            nested_checks.append(_extra_fields_variant(variant_col, f.dataType, subpath))
+
+    # Combine this level + all nested levels
+    if nested_checks:
+        return reduce(lambda a, b: a | b, [has_extra_here] + nested_checks)
+    else:
+        return has_extra_here
