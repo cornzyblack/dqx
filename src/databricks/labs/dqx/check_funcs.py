@@ -1853,20 +1853,10 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     is_not_corrupt = parsed_struct[corrupt_record_name].isNull()
     base_conformity = ~is_invalid_json & is_not_corrupt
 
-    # _get_strict_schema_comparison()
-    # _get_permissive_schema_comparison
-
     if strict:
-        expected_field_names = [f.name for f in _expected_schema.fields]
-        # concatenated_fields = F.concat_ws("_", *[parsed_struct[name] for name in expected_field_names])
-        # has_content = concatenated_fields.isNotNull()
-        has_content = F.when(
-            ~is_invalid_json,
-            F.transform(
-                F.schema_of_json(F.to_json(col_expr)),
-                lambda inferred_schema: _get_strict_schema_comparison(inferred_schema, _expected_schema),
-            ).isNotNull(),
-        ).otherwise(F.lit(False))
+        parsed_col_name = f"{unique_prefix}_parsed_json"
+        condition_str = " AND ".join(_generate_not_null_expr(_expected_schema, parsed_col_name))
+        has_content = F.expr(condition_str)
         is_conforming = base_conformity & has_content
     else:
         is_conforming = base_conformity
@@ -1938,7 +1928,6 @@ def _get_strict_schema_comparison(actual_schema: types.StructType, expected_sche
     """
 
     errors = []
-    print(type(actual_schema), actual_schema)
     if actual_schema == expected_schema:
         return []
 
@@ -2820,3 +2809,14 @@ def _validate_sql_query_params(query: str, merge_columns: list[str]) -> None:
         raise UnsafeSqlQueryError(
             "Provided SQL query is not safe for execution. Please ensure it does not contain any unsafe operations."
         )
+
+
+def _generate_not_null_expr(schema: types.StructType, col_name: str) -> list[str]:
+    exprs = []
+    for field in schema.fields:
+        field_path = f"{col_name}.{field.name}"
+        if isinstance(field.dataType, types.StructType):
+            exprs += _generate_not_null_expr(field.dataType, col_name=field_path)
+        else:
+            exprs.append(f"{field_path} IS NOT NULL")
+    return exprs
