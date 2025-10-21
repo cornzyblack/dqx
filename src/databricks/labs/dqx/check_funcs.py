@@ -1859,21 +1859,14 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     is_not_corrupt = parsed_struct[corrupt_record_name].isNull()
     base_conformity = ~is_invalid_json & is_not_corrupt
 
-    if strict:
-        map_json = F.from_json(col_expr, types.MapType(types.StringType(), types.StringType()))
-        # json_keys = F.map_keys(map_json)
-        # expected_keys = [F.lit(f.name) for f in _expected_schema.fields]
-
-        # has_extra_fields = F.size(F.array_except(json_keys, F.array(*expected_keys))) > 0
+    if not strict:
         not_null_checks = _generate_not_null_expr(_expected_schema, parsed_struct)
         has_null_fields = F.array_contains(F.array(*[F.coalesce(e, F.lit(False)) for e in not_null_checks]), False)
 
-        # is_conforming = base_conformity & ~has_extra_fields & ~has_null_fields
         is_conforming = base_conformity & ~has_null_fields
 
     else:
-        is_conforming = base_conformity & (F.size(F.json_object_keys(col_expr)) > 0)
-
+        is_conforming = base_conformity
 
     condition = is_conforming | col_expr.isNull()
     schema_str = _expected_schema.simpleString()
@@ -2830,7 +2823,7 @@ def _generate_not_null_expr(schema: types.StructType, col_name: Column) -> list[
     Generate a list of expressions that check for non-null values in the given schema.
 
     Args:
-        schema: The schema of the DataFrame.
+        schema: The expected schema.
         col_name: The name of the column to check.
 
     Returns:
