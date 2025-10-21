@@ -1824,51 +1824,59 @@ def has_json_keys(column: str | Column, keys: list[str], require_all: bool = Tru
 @register_rule("row")
 def has_valid_json_schema(column: str | Column, schema: str | types.StructType) -> Column:
     """
-    Checks whether the values in the input column conform to a specified JSON schema.
+    Validates that JSON strings in the specified column conform to an expected schema.
 
     Args:
-        column: The name of the column or the column expression to check for JSON schema conformity.
-        schema: The expected JSON schema as a DDL string (e.g., "id INT, name STRING") or StructType object.
+        column: Column name or Column expression containing JSON strings.
+        schema: Expected schema as a DDL string (e.g., "id INT, name STRING") or StructType.
 
     Returns:
-        Column: A Spark Column indicating schema validity; False if violations are found.
+        Column: Boolean condition representing JSON schema validity.
     """
+
     _expected_schema = _get_schema(schema)
+    schema_str = _expected_schema.simpleString()
     col_str_norm, col_expr_str, col_expr = _get_normalized_column_and_expr(column)
 
     json_validation_error = is_valid_json(col_str_norm)
     is_invalid_json = json_validation_error.isNotNull()
 
-    unique_prefix = uuid.uuid4().hex[:8]
-    corrupt_record_name = f"{unique_prefix}_dqx_corrupt_record"
+    # Add unique corrupt-record field to isolate parse errors
+    corrupt_record_name = f"{uuid.uuid4().hex[:8]}_dqx_corrupt_record"
 
     extended_schema = types.StructType(
         _expected_schema.fields + [types.StructField(corrupt_record_name, types.StringType(), True)]
     )
 
+    # Attempt to parse JSON using the extended schema
     parsed_struct = F.from_json(
         col_expr,
         extended_schema,
         options={"columnNameOfCorruptRecord": corrupt_record_name},
     )
 
+    # Core conformity: must be valid JSON and not corrupt
     is_not_corrupt = parsed_struct[corrupt_record_name].isNull()
     base_conformity = ~is_invalid_json & is_not_corrupt
-    schema_str = _expected_schema.simpleString()
 
-    not_null_checks = _generate_field_presence_checks(_expected_schema, parsed_struct)
-    has_null_fields = F.array_contains(F.array(*[F.coalesce(e, F.lit(False)) for e in not_null_checks]), False)
+    # Field presence checks (non-null + exists)
+    field_presence_checks = _generate_field_presence_checks(_expected_schema, parsed_struct)
+    has_missing_or_null_fields = F.array_contains(
+        F.array(*[F.coalesce(expr, F.lit(False)) for expr in field_presence_checks]),
+        False,
+    )
 
-    is_conforming = base_conformity & ~has_null_fields
-
+    is_conforming = base_conformity & ~has_missing_or_null_fields
     condition = is_conforming | col_expr.isNull()
+
     error_msg = F.concat_ws(
         "",
         F.lit("Value '"),
         F.when(col_expr.isNull(), F.lit("null")).otherwise(col_expr.cast("string")),
-        F.lit(f"' in Column '{col_expr_str}' does not conform to expected JSON schema"),
+        F.lit(f"' in column '{col_expr_str}' does not conform to expected JSON schema: "),
         F.lit(schema_str),
     )
+
     final_error_msg = F.when(is_invalid_json, json_validation_error).otherwise(error_msg)
 
     return make_condition(
@@ -2823,11 +2831,11 @@ def _generate_field_presence_checks(expected_schema: types.StructType, parsed_st
         A list of Column expressions, one per field in the expected schema, that evaluate to True
         if the corresponding field is non-null.
     """
-    checks = []
+    validations = []
     for field in expected_schema.fields:
         field_ref = parsed_struct_col[field.name]
         if isinstance(field.dataType, types.StructType):
-            checks += _generate_field_presence_checks(field.dataType, field_ref)
+            validations += _generate_field_presence_checks(field.dataType, field_ref)
         else:
-            checks.append(field_ref.isNotNull())
-    return checks
+            validations.append(field_ref.isNotNull())
+    return validations
