@@ -1871,7 +1871,11 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
         is_conforming = base_conformity & ~has_null_fields
 
     else:
-        is_conforming = base_conformity & (_normalize_schema_str(F.schema_of_json(F.from_json(col_expr, _expected_schema))) == _normalize_schema_str(F.lit(schema_str)))
+        is_conforming = base_conformity & (
+            _normalize_schema_str(F.schema_of_json(
+            F.from_json(col_expr, _expected_schema).alias("test")
+            )
+        ) == _normalize_schema_str(F.lit(schema_str)))
 
     condition = is_conforming | col_expr.isNull()
     error_msg = F.concat_ws(
