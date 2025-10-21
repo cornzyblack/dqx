@@ -2851,7 +2851,7 @@ def _extra_fields_variant(variant_col: F.Column, schema: types.StructType, path:
     expected_keys = [F.lit(f.name) for f in schema.fields]
 
     # Get actual JSON keys at this level (Variant supports keys(path))
-    actual_keys = F.keys(variant_col, path)
+    actual_keys = F.variant_get(variant_col, path)
 
     # Detect extra keys at this level
     has_extra_here = F.size(F.array_except(actual_keys, F.array(*expected_keys))) > 0
