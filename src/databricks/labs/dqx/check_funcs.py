@@ -1853,8 +1853,8 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
     base_conformity = ~is_invalid_json & is_not_corrupt
 
     if strict:
-        condition_str = " AND ".join(_generate_not_null_expr(_expected_schema, parsed_struct))
-        has_content = F.expr(condition_str)
+        exprs = (_generate_not_null_expr(_expected_schema, parsed_struct))
+        has_content = F.every(F.array(*exprs))
         is_conforming = base_conformity & has_content
     else:
         is_conforming = base_conformity
