@@ -1861,14 +1861,16 @@ def has_valid_json_schema(column: str | Column, schema: str | types.StructType, 
 
     if strict:
         map_json = F.from_json(col_expr, types.MapType(types.StringType(), types.StringType()))
-        json_keys = F.map_keys(map_json)
-        expected_keys = [F.lit(f.name) for f in _expected_schema.fields]
+        # json_keys = F.map_keys(map_json)
+        # expected_keys = [F.lit(f.name) for f in _expected_schema.fields]
 
-        has_extra_fields = F.size(F.array_except(json_keys, F.array(*expected_keys))) > 0
+        # has_extra_fields = F.size(F.array_except(json_keys, F.array(*expected_keys))) > 0
         not_null_checks = _generate_not_null_expr(_expected_schema, parsed_struct)
         has_null_fields = F.array_contains(F.array(*[F.coalesce(e, F.lit(False)) for e in not_null_checks]), False)
 
-        is_conforming = base_conformity & ~has_extra_fields & ~has_null_fields
+        # is_conforming = base_conformity & ~has_extra_fields & ~has_null_fields
+        is_conforming = base_conformity & ~has_null_fields
+
     else:
         is_conforming = base_conformity & (F.size(F.json_object_keys(col_expr)) > 0)
 
