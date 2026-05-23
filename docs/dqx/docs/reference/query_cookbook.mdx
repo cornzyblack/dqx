@@ -472,6 +472,7 @@ summary_df = spark.table("catalog.schema.summary_metrics")
 
 trend_df = (
     summary_df
+    .filter(F.col("metric_name") != "check_metrics")
     .groupBy("run_id", "run_time", "input_location")
     .pivot("metric_name")
     .agg(F.first(F.col("metric_value").cast("double")))

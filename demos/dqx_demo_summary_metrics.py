@@ -238,36 +238,6 @@ display(spark.table(metrics_table_name))
 
 # COMMAND ----------
 
-display(spark.sql(f"""
-    SELECT
-      run_id,
-      run_time,
-      output_location,
-      quarantine_location,
-      rule_set_fingerprint
-    FROM {metrics_table_name}
-    ORDER BY run_time DESC
-"""))
-
-# COMMAND ----------
-
-display(spark.sql(f"""
-    SELECT sm.*
-    FROM {metrics_table_name} sm
-    INNER JOIN (
-      SELECT DISTINCT e.run_id
-      FROM {quarantine_table_name} t
-      LATERAL VIEW explode(t._errors) AS e
-      UNION
-      SELECT DISTINCT w.run_id
-      FROM {quarantine_table_name} t
-      LATERAL VIEW explode(t._warnings) AS w
-    ) runs ON sm.run_id = runs.run_id
-    ORDER BY sm.run_time DESC
-"""))
-
-# COMMAND ----------
-
 from databricks.labs.dqx.config import InputConfig
 
 # Create some input data
@@ -599,6 +569,7 @@ import pyspark.sql.functions as F
 
 trend_df = (
     spark.table(metrics_table_name)
+    .filter(F.col("metric_name") != "check_metrics")
     .groupBy("run_id", "run_time", "input_location")
     .pivot("metric_name")
     .agg(F.first(F.col("metric_value").cast("double")))
