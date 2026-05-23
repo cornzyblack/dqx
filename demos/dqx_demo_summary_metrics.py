@@ -238,28 +238,34 @@ display(spark.table(metrics_table_name))
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC SELECT
-# MAGIC   run_id,
-# MAGIC   run_time,
-# MAGIC   output_location,
-# MAGIC   quarantine_location,
-# MAGIC   rule_set_fingerprint
-# MAGIC FROM main.default.metrics_table
-# MAGIC ORDER BY run_time DESC
-# MAGIC LIMIT 1;
+display(spark.sql(f"""
+    SELECT
+      run_id,
+      run_time,
+      output_location,
+      quarantine_location,
+      rule_set_fingerprint
+    FROM {metrics_table_name}
+    ORDER BY run_time DESC
+    LIMIT 1
+"""))
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC SELECT sm.*
-# MAGIC FROM main.default.metrics_table sm
-# MAGIC INNER JOIN (
-# MAGIC   SELECT DISTINCT e.run_id
-# MAGIC   FROM main.default.quarantine_table t
-# MAGIC   LATERAL VIEW explode(t._errors) AS e
-# MAGIC ) runs ON sm.run_id = runs.run_id
-# MAGIC ORDER BY sm.run_time DESC;
+display(spark.sql(f"""
+    SELECT sm.*
+    FROM {metrics_table_name} sm
+    INNER JOIN (
+      SELECT DISTINCT e.run_id
+      FROM {quarantine_table_name} t
+      LATERAL VIEW explode(t._errors) AS e
+      UNION
+      SELECT DISTINCT w.run_id
+      FROM {quarantine_table_name} t
+      LATERAL VIEW explode(t._warnings) AS w
+    ) runs ON sm.run_id = runs.run_id
+    ORDER BY sm.run_time DESC
+"""))
 
 # COMMAND ----------
 
@@ -348,28 +354,322 @@ display(filtered_results_df)
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- Step 1: get a run_id. Adjust the filter or ordering to select a different run.
-# MAGIC SELECT
-# MAGIC   run_id,
-# MAGIC   run_time,
-# MAGIC   output_location,
-# MAGIC   quarantine_location,
-# MAGIC   rule_set_fingerprint
-# MAGIC FROM main.default.summary_metrics
-# MAGIC ORDER BY run_time DESC
-# MAGIC LIMIT 1;
+# SQL equivalent using spark.sql with dynamic table names
+latest_row = spark.sql(f"""
+    SELECT run_id, run_time, output_location, quarantine_location, rule_set_fingerprint
+    FROM {metrics_table_name}
+    ORDER BY run_time DESC
+    LIMIT 1
+""").first()
+display(latest_row)
+
+run_id_sql = latest_row["run_id"]
+
+display(spark.sql(f"""
+    SELECT t.*, e.*
+    FROM {quarantine_table_name} t
+    LATERAL VIEW explode(t._errors) AS e
+    WHERE e.run_id = '{run_id_sql}'
+"""))
+
+display(spark.sql(f"""
+    SELECT t.*, w.*
+    FROM {quarantine_table_name} t
+    LATERAL VIEW explode(t._warnings) AS w
+    WHERE w.run_id = '{run_id_sql}'
+"""))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Cookbook Query Validation
 # MAGIC
+# MAGIC The following cells validate every recipe in the [Lineage Query Cookbook](/docs/reference/query_cookbook).
 # MAGIC
-# MAGIC
-# MAGIC -- Step 2: replace <run_id> with a value from the query above.
-# MAGIC SELECT t.*, e.*
-# MAGIC FROM main.default.quarantine_table t
-# MAGIC LATERAL VIEW OUTER explode(t._errors) AS e
-# MAGIC WHERE e.run_id = '<run_id>';
-# MAGIC
-# MAGIC -- Use the same pattern with _warnings to inspect warning-level issues.
-# MAGIC SELECT t.*, w.*
-# MAGIC FROM main.default.quarantine_table t
-# MAGIC LATERAL VIEW OUTER explode(t._warnings) AS w
-# MAGIC WHERE w.run_id = '<run_id>';
+# MAGIC This section saves checks to a table so that `checks_location` is populated in metrics,
+# MAGIC enabling Recipes 3 (to checks table), 4, 5, and 6. It also runs the pipeline twice so
+# MAGIC Recipe 7 (run tracking over time) has multiple runs to show.
+
+# COMMAND ----------
+
+from databricks.labs.dqx.config import TableChecksStorageConfig
+
+checks_table_name = f"{demo_catalog_name}.{demo_schema_name}.checks_table"
+
+# Save checks to a table so checks_location is populated in metrics
+dq_engine.save_checks(
+    checks_from_yaml,
+    config=TableChecksStorageConfig(location=checks_table_name, mode="overwrite"),
+)
+
+# Run the pipeline twice: first run overwrites output/quarantine, both runs append to metrics
+for i in range(2):
+    dq_engine.apply_checks_by_metadata_and_save_in_table(
+        checks_location=checks_table_name,
+        input_config=InputConfig(location=input_table_name),
+        output_config=OutputConfig(location=output_table_name, mode="overwrite"),
+        quarantine_config=OutputConfig(location=quarantine_table_name, mode="overwrite"),
+        metrics_config=OutputConfig(location=metrics_table_name, mode="append"),
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 1: A quick peek at each table
+
+display(spark.table(metrics_table_name).limit(5))
+display(spark.table(output_table_name).limit(5))
+display(spark.table(quarantine_table_name).limit(5))
+display(spark.table(checks_table_name).limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 2: Summary to Row-Level Errors
+
+import pyspark.sql.functions as F
+
+latest = (
+    spark.table(metrics_table_name)
+    .orderBy(F.col("run_time").desc())
+    .first()
+)
+run_id = latest["run_id"]
+quarantine_table = latest["quarantine_location"]
+# spark.table() works when quarantine_location is a table name (e.g. catalog.schema.table).
+# If it is a storage path (/Volumes/..., s3://..., abfss://...), use spark.read.format(...).load(quarantine_table) instead.
+
+errors_df = (
+    spark.table(quarantine_table)
+    .select(F.explode(F.col("_errors")).alias("result"))
+    .select(F.expr("result.*"))
+    .filter(F.col("run_id") == run_id)
+)
+warnings_df = (
+    spark.table(quarantine_table)
+    .select(F.explode(F.col("_warnings")).alias("result"))
+    .select(F.expr("result.*"))
+    .filter(F.col("run_id") == run_id)
+)
+display(errors_df)
+display(warnings_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 3: Row Details
+# MAGIC #### To Run Summary
+
+import pyspark.sql.functions as F
+
+quarantine_df = spark.table(quarantine_table_name)
+error_run_ids = (
+    quarantine_df
+    .select(F.explode(F.col("_errors")).alias("result"))
+    .select(F.expr("result.*"))
+    .select("run_id")
+)
+warning_run_ids = (
+    quarantine_df
+    .select(F.explode(F.col("_warnings")).alias("result"))
+    .select(F.expr("result.*"))
+    .select("run_id")
+)
+run_ids_df = error_run_ids.union(warning_run_ids).distinct()
+result_df = spark.table(metrics_table_name).join(run_ids_df, on="run_id")
+display(result_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### To Checks Table
+
+import pyspark.sql.functions as F
+
+errors_df = (
+    spark.table(quarantine_table_name)
+    .select(F.explode(F.col("_errors")).alias("result"))
+    .select(F.expr("result.*"))
+)
+checks_df = spark.table(checks_table_name)
+result_df = (
+    errors_df
+    .join(checks_df, on=["rule_fingerprint", "rule_set_fingerprint"])
+    .select("name", "message", "columns", "check.function", "check.arguments", "filter", "criticality")
+)
+display(result_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 4: Summary to Checks Table
+
+import pyspark.sql.functions as F
+
+run_info = (
+    spark.table(metrics_table_name)
+    .filter(F.col("run_id") == run_id)
+    .select("rule_set_fingerprint")
+    .first()
+)
+checks_df = (
+    spark.table(checks_table_name)
+    .filter(F.col("rule_set_fingerprint") == run_info["rule_set_fingerprint"])
+)
+display(checks_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 5: Which Checks Failed for a Run
+# MAGIC #### From check_metrics (no joins needed)
+
+from pyspark.sql.types import ArrayType, StructType, StructField, StringType, LongType
+import pyspark.sql.functions as F
+
+check_metrics_schema = ArrayType(StructType([
+    StructField("check_name", StringType()),
+    StructField("error_count", LongType()),
+    StructField("warning_count", LongType()),
+]))
+
+failed_checks_df = (
+    spark.table(metrics_table_name)
+    .filter((F.col("run_id") == run_id) & (F.col("metric_name") == "check_metrics"))
+    .select(F.explode(F.from_json(F.col("metric_value"), check_metrics_schema)).alias("cm"))
+    .select("cm.*")
+    .filter((F.col("error_count") > 0) | (F.col("warning_count") > 0))
+)
+display(failed_checks_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### With check definitions (join to checks table)
+
+import pyspark.sql.functions as F
+
+errors_df = (
+    spark.table(quarantine_table_name)
+    .select(F.explode(F.col("_errors")).alias("result"))
+    .select(F.expr("result.*"))
+    .filter(F.col("run_id") == run_id)
+)
+checks_df = spark.table(checks_table_name)
+failed_checks_df = (
+    errors_df
+    .select("name", "rule_fingerprint", "rule_set_fingerprint")
+    .distinct()
+    .join(checks_df, on=["rule_fingerprint", "rule_set_fingerprint"], how="left")
+)
+display(failed_checks_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 6: Which Rules Were Applied in a Run
+
+import pyspark.sql.functions as F
+
+rsf = (
+    spark.table(metrics_table_name)
+    .filter(F.col("run_id") == run_id)
+    .select("rule_set_fingerprint")
+    .first()["rule_set_fingerprint"]
+)
+rules_df = (
+    spark.table(checks_table_name)
+    .filter(F.col("rule_set_fingerprint") == rsf)
+    .select("name", "criticality", "check.function", "check.arguments", "filter")
+    .orderBy("name")
+)
+display(rules_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 7: Run Tracking Over Time
+
+import pyspark.sql.functions as F
+
+trend_df = (
+    spark.table(metrics_table_name)
+    .groupBy("run_id", "run_time", "input_location")
+    .pivot("metric_name")
+    .agg(F.first(F.col("metric_value").cast("double")))
+    .withColumn(
+        "error_rate_pct",
+        F.round(F.col("error_row_count") / F.col("input_row_count") * 100, 2),
+    )
+    .orderBy(F.col("run_time").desc())
+)
+display(trend_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 8: Scoping to One Table
+
+import pyspark.sql.functions as F
+
+summary_df = spark.table(metrics_table_name)
+
+# List all input tables tracked in the metrics table
+summary_df.select("input_location").distinct().orderBy("input_location").display()
+
+# Get the latest run scoped to the specific input table used in this demo
+latest_scoped = (
+    summary_df
+    .filter(F.col("input_location") == input_table_name)
+    .orderBy(F.col("run_time").desc())
+    .first()
+)
+display(latest_scoped)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 9: Checks by Run Config
+
+import pyspark.sql.functions as F
+
+checks_df = spark.table(checks_table_name)
+
+# List all run_config_name values in the checks table
+checks_df.select("run_config_name").distinct().orderBy("run_config_name").display()
+
+# Load checks for the default run config (used when run_config_name is not set explicitly)
+checks_df.filter(F.col("run_config_name") == "default").display()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Recipe 10: First Failure per Check
+
+from pyspark.sql.types import ArrayType, StructType, StructField, StringType, LongType
+import pyspark.sql.functions as F
+
+check_metrics_schema = ArrayType(StructType([
+    StructField("check_name", StringType()),
+    StructField("error_count", LongType()),
+    StructField("warning_count", LongType()),
+]))
+
+first_failures_df = (
+    spark.table(metrics_table_name)
+    .filter(F.col("metric_name") == "check_metrics")
+    .select(
+        "run_id",
+        "run_time",
+        F.explode(F.from_json(F.col("metric_value"), check_metrics_schema)).alias("cm"),
+    )
+    .select("run_id", "run_time", F.col("cm.check_name"), F.col("cm.error_count"))
+    .filter(F.col("error_count") > 0)
+    .groupBy("check_name")
+    .agg(
+        F.min("run_time").alias("first_failure_time"),
+        F.min_by("run_id", "run_time").alias("first_failure_run_id"),
+    )
+    .orderBy(F.col("first_failure_time").desc())
+)
+display(first_failures_df)
