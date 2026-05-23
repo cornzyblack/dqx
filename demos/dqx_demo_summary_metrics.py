@@ -402,9 +402,12 @@ dq_engine.save_checks(
     config=TableChecksStorageConfig(location=checks_table_name, mode="overwrite"),
 )
 
-# Run the pipeline twice: first run overwrites output/quarantine, both runs append to metrics
+# Run the pipeline twice with a fresh engine each time so each run gets a unique run_id.
+# DQMetricsObserver.id is a cached_property — reusing the same engine/observer across
+# runs produces the same run_id for every run, which breaks Recipe 2 and run-scoped queries.
 for i in range(2):
-    dq_engine.apply_checks_by_metadata_and_save_in_table(
+    run_engine = DQEngine(ws, observer=DQMetricsObserver())
+    run_engine.apply_checks_by_metadata_and_save_in_table(
         checks_location=checks_table_name,
         input_config=InputConfig(location=input_table_name),
         output_config=OutputConfig(location=output_table_name, mode="overwrite"),
@@ -493,9 +496,17 @@ errors_df = (
 )
 checks_df = spark.table(checks_table_name)
 result_df = (
-    errors_df
-    .join(checks_df, on=["rule_fingerprint", "rule_set_fingerprint"])
-    .select("name", "message", "columns", "check.function", "check.arguments", "filter", "criticality")
+    errors_df.alias("e")
+    .join(checks_df.alias("c"), on=["rule_fingerprint", "rule_set_fingerprint"])
+    .select(
+        F.col("e.name").alias("error_name"),
+        F.col("e.message"),
+        F.col("e.columns"),
+        F.col("c.check.function"),
+        F.col("c.check.arguments"),
+        F.col("c.filter"),
+        F.col("c.criticality"),
+    )
 )
 display(result_df)
 
@@ -558,7 +569,11 @@ errors_df = (
 checks_df = spark.table(checks_table_name)
 failed_checks_df = (
     errors_df
-    .select("name", "rule_fingerprint", "rule_set_fingerprint")
+    .select(
+        F.col("name").alias("error_name"),
+        "rule_fingerprint",
+        "rule_set_fingerprint",
+    )
     .distinct()
     .join(checks_df, on=["rule_fingerprint", "rule_set_fingerprint"], how="left")
 )
