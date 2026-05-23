@@ -247,7 +247,6 @@ display(spark.sql(f"""
       rule_set_fingerprint
     FROM {metrics_table_name}
     ORDER BY run_time DESC
-    LIMIT 1
 """))
 
 # COMMAND ----------
@@ -417,8 +416,7 @@ for i in range(2):
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 1: A quick peek at each table
+### Recipe 1: A quick peek at each table
 
 display(spark.table(metrics_table_name).limit(5))
 display(spark.table(output_table_name).limit(5))
@@ -427,8 +425,7 @@ display(spark.table(checks_table_name).limit(5))
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 2: Summary to Row-Level Errors
+### Recipe 2: Summary to Row-Level Errors
 
 import pyspark.sql.functions as F
 
@@ -459,9 +456,8 @@ display(warnings_df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 3: Row Details
-# MAGIC #### To Run Summary
+### Recipe 3: Row Details
+#### To Run Summary
 
 import pyspark.sql.functions as F
 
@@ -484,8 +480,7 @@ display(result_df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC #### To Checks Table
+#### To Checks Table
 
 import pyspark.sql.functions as F
 
@@ -512,8 +507,7 @@ display(result_df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 4: Summary to Checks Table
+### Recipe 4: Summary to Checks Table
 
 import pyspark.sql.functions as F
 
@@ -531,9 +525,8 @@ display(checks_df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 5: Which Checks Failed for a Run
-# MAGIC #### From check_metrics (no joins needed)
+### Recipe 5: Which Checks Failed for a Run
+#### From check_metrics (no joins needed)
 
 from pyspark.sql.types import ArrayType, StructType, StructField, StringType, LongType
 import pyspark.sql.functions as F
@@ -555,8 +548,7 @@ display(failed_checks_df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC #### With check definitions (join to checks table)
+#### With check definitions (join to checks table)
 
 import pyspark.sql.functions as F
 
@@ -581,8 +573,7 @@ display(failed_checks_df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 6: Which Rules Were Applied in a Run
+### Recipe 6: Which Rules Were Applied in a Run
 
 import pyspark.sql.functions as F
 
@@ -602,8 +593,7 @@ display(rules_df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 7: Run Tracking Over Time
+### Recipe 7: Run Tracking Over Time
 
 import pyspark.sql.functions as F
 
@@ -622,8 +612,7 @@ display(trend_df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 8: Scoping to One Table
+### Recipe 8: Scoping to One Table
 
 import pyspark.sql.functions as F
 
@@ -643,8 +632,7 @@ display(latest_scoped)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 9: Checks by Run Config
+### Recipe 9: Checks by Run Config
 
 import pyspark.sql.functions as F
 
@@ -658,8 +646,7 @@ checks_df.filter(F.col("run_config_name") == "default").display()
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Recipe 10: First Failure per Check
+### Recipe 10: First Failure per Check
 
 from pyspark.sql.types import ArrayType, StructType, StructField, StringType, LongType
 import pyspark.sql.functions as F
@@ -688,3 +675,7 @@ first_failures_df = (
     .orderBy(F.col("first_failure_time").desc())
 )
 display(first_failures_df)
+
+# COMMAND ----------
+
+
