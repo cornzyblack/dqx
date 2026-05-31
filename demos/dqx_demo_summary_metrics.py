@@ -649,4 +649,61 @@ display(first_failures_df)
 
 # COMMAND ----------
 
+### Recipe 11: All Failures per Check
+
+import pyspark.sql.functions as F
+
+# Pick the first check name that produced an error — substitute any name from Recipe 5 or Recipe 10.
+check_name = (
+    spark.table(quarantine_table_name)
+    .select(F.explode(F.col("_errors")).alias("e"))
+    .select(F.col("e.name"))
+    .first()["name"]
+)
+
+failures_df = (
+    spark.table(quarantine_table_name)
+    .select("*", F.explode(F.col("_errors")).alias("e"))
+    .filter(F.col("e.name") == check_name)
+    .select("*", F.col("e.run_id"), F.col("e.name").alias("check_name"), F.col("e.rule_fingerprint"))
+    .drop("_errors", "_warnings", "e")
+    .orderBy(F.col("run_id").desc())
+)
+display(failures_df)
+
+# COMMAND ----------
+
+### Recipe 12: Summary Metrics Pivot
+
+import pyspark.sql.functions as F
+
+metrics = ["input_row_count", "error_row_count", "warning_row_count", "valid_row_count"]
+
+# One row per run, metrics as columns.
+pivot_df = (
+    spark.table(metrics_table_name)
+    .filter(F.col("metric_name").isin(metrics))
+    .withColumn("metric_value", F.col("metric_value").cast("long"))
+    .groupBy("run_id", "run_time")
+    .pivot("metric_name", metrics)
+    .agg(F.max("metric_value"))
+    .orderBy(F.col("run_time").desc())
+)
+display(pivot_df)
+
+# Group by day — change "day" to "week" or "month" as needed.
+daily_df = (
+    spark.table(metrics_table_name)
+    .filter(F.col("metric_name").isin(metrics))
+    .withColumn("metric_value", F.col("metric_value").cast("long"))
+    .withColumn("run_day", F.date_trunc("day", F.col("run_time")))
+    .groupBy("run_day")
+    .pivot("metric_name", metrics)
+    .agg(F.max("metric_value"))
+    .orderBy(F.col("run_day").desc())
+)
+display(daily_df)
+
+# COMMAND ----------
+
 
