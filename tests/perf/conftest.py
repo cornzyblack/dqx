@@ -32,7 +32,7 @@ SCHEMA_STR = (
     "col1: int, col2: int, col3: int, col4: array<int>, "
     "col5: date, col6: timestamp, col7: map<string, int>, "
     "col8: struct<field1: int>, col10: int, col_ipv4: string, col_ipv6: string, "
-    "col_json_str: string"
+    "col_json_str: string, col_geo_point: string"
 )
 
 RUN_TIME = datetime(2025, 1, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
@@ -89,7 +89,7 @@ def all_dataset_geo_checks():
 def table_name(make_schema, make_random):
     catalog = TEST_CATALOG
     schema = make_schema(catalog_name=catalog).name
-    return f"{catalog}.{schema}.{make_random(10).lower()}"
+    return f"{catalog}.{schema}.t{make_random(10).lower()}"
 
 
 @pytest.fixture
@@ -110,6 +110,15 @@ def generated_df(spark, rows=DEFAULT_ROWS):
         .withColumnSpec("col_ipv4", template=r"\n.\n.\n.\n")
         .withColumnSpec("col_ipv6", template="XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX")
         .withColumnSpec("col_json_str", template=r"{'key1': '\w', 'key2': 'd\w'}")
+        .withColumnSpec(
+            "col_geo_point",
+            values=[
+                "POINT(4.90 52.37)",
+                "POINT(4.73 52.28)",
+                "POINT(4.48 51.92)",
+                "POINT(5.20 52.35)",
+            ],
+        )
     )
     return spec.build()
 
@@ -285,3 +294,192 @@ def generated_timestamp_df(request, spark):
     for col in col_names:
         data_gen = data_gen.withColumn(col, "timestamp", begin=begin, end=end, interval=interval, **opts)
     return col_names, data_gen.build(), n_rows
+
+
+@pytest.fixture
+def generated_email_df(spark):
+    email_schema_str = (
+        "col1_email_standard: string, "
+        "col2_email_with_quoted_local_part: string, "
+        "col3_email_with_ip_domain: string, "
+        "col4_email_with_multi_part_domain: string"
+    )
+    schema = _parse_datatype_string(email_schema_str)
+
+    email_templates = {
+        "col1_email_standard": r"kkkkkkkkkkkk@kkkkkkkk.org",
+        "col2_email_with_quoted_local_part": r"\"kkkkkkkkkkkk\"@kkkkkkkk.org",
+        "col3_email_with_ip_domain": r"kkkkkkkkkkkk@\[\\n.\\n.\\n.\\n\]",
+        "col4_email_with_multi_part_domain": r"kkkkkkkkkkkk@kkkk.kkkk.com",
+    }
+
+    _, gen = make_data_gen(spark, n_rows=DEFAULT_ROWS, n_columns=len(email_templates), partitions=DEFAULT_PARTITIONS)
+    gen = gen.withSchema(schema)
+    for col, template in email_templates.items():
+        gen = gen.withColumnSpec(col, template=template)
+
+    return gen.build()
+
+
+@pytest.fixture
+def generated_url_df(spark):
+    url_schema_str = (
+        "col1_url_standard: string, "
+        "col2_url_with_path_and_query: string, "
+        "col3_url_with_userinfo_and_port: string, "
+        "col4_url_with_pct_encoding: string"
+    )
+    schema = _parse_datatype_string(url_schema_str)
+
+    url_templates = {
+        "col1_url_standard": r"https://kkkkkkkk.org",
+        "col2_url_with_path_and_query": r"https://kkkkkkkk.org/kkkk/kkkk\?kkkk=kkkk",
+        "col3_url_with_userinfo_and_port": r"https://kkkk:kkkk@kkkkkkkk.org:\n\n\n\n/kkkk",
+        "col4_url_with_pct_encoding": r"https://kkkkkkkk.org/kkkk%20kkkk%2Fkkkk",
+    }
+
+    _, gen = make_data_gen(spark, n_rows=DEFAULT_ROWS, n_columns=len(url_templates), partitions=DEFAULT_PARTITIONS)
+    gen = gen.withSchema(schema)
+    for col, template in url_templates.items():
+        gen = gen.withColumnSpec(col, template=template)
+
+    return gen.build()
+
+
+@pytest.fixture
+def generated_national_id_df(spark):
+    ssn_schema_str = (
+        "col1_ssn_dashed: string, " "col2_ssn_plain: string, " "col3_ssn_valid_area: string, " "col4_ssn_spaced: string"
+    )
+    schema = _parse_datatype_string(ssn_schema_str)
+
+    ssn_templates = {
+        "col1_ssn_dashed": r"\n\n\n-\n\n-\n\n\n\n",
+        "col2_ssn_plain": r"\n\n\n\n\n\n\n\n\n",
+        "col3_ssn_valid_area": r"1\n\n-\n\n-\n\n\n\n",
+        "col4_ssn_spaced": r"\n\n\n \n\n \n\n\n\n",
+    }
+
+    _, gen = make_data_gen(spark, n_rows=DEFAULT_ROWS, n_columns=len(ssn_templates), partitions=DEFAULT_PARTITIONS)
+    gen = gen.withSchema(schema)
+    for col, template in ssn_templates.items():
+        gen = gen.withColumnSpec(col, template=template)
+
+    return gen.build()
+
+
+@pytest.fixture
+def generated_uuid_df(spark):
+    uuid_schema_str = (
+        "col1_uuid_v4_lowercase: string, "
+        "col2_uuid_v4_uppercase: string, "
+        "col3_uuid_v1_lowercase: string, "
+        "col4_uuid_mixed_case: string"
+    )
+    schema = _parse_datatype_string(uuid_schema_str)
+
+    uuid_templates = {
+        "col1_uuid_v4_lowercase": r"xxxxxxxx-xxxx-4xxx-9xxx-xxxxxxxxxxxx",
+        "col2_uuid_v4_uppercase": r"XXXXXXXX-XXXX-4XXX-9XXX-XXXXXXXXXXXX",
+        "col3_uuid_v1_lowercase": r"xxxxxxxx-xxxx-1xxx-8xxx-xxxxxxxxxxxx",
+        "col4_uuid_mixed_case": r"xxxxXXXX-xxXX-4xXx-9xXx-xxxxXXXXxxxx",
+    }
+
+    _, gen = make_data_gen(spark, n_rows=DEFAULT_ROWS, n_columns=len(uuid_templates), partitions=DEFAULT_PARTITIONS)
+    gen = gen.withSchema(schema)
+    for col, template in uuid_templates.items():
+        gen = gen.withColumnSpec(col, template=template)
+
+    return gen.build()
+
+
+@pytest.fixture
+def generated_country_code_df(spark):
+    # Mostly-valid vs mostly-invalid mixes (rather than a single fixed value) so the benchmark
+    # exercises isin() with a realistic hit ratio in both directions, since isin performance can
+    # differ between an all-miss workload and one with a mix of hits and misses.
+    country_schema_str = "col1_country_code: string, col2_country_code: string"
+    schema = _parse_datatype_string(country_schema_str)
+
+    country_value_lists = {
+        "col1_country_code": ["US", "GB", "DE", "FR", "JP", "AA"],
+        "col2_country_code": ["AA", "KK", "ZZ", "US"],
+    }
+
+    _, gen = make_data_gen(
+        spark, n_rows=DEFAULT_ROWS, n_columns=len(country_value_lists), partitions=DEFAULT_PARTITIONS
+    )
+    gen = gen.withSchema(schema)
+    for col, values in country_value_lists.items():
+        gen = gen.withColumnSpec(col, values=values)
+
+    return gen.build()
+
+
+@pytest.fixture
+def generated_currency_code_df(spark):
+    # Mostly-valid vs mostly-invalid mixes (rather than a single fixed value) so the benchmark
+    # exercises isin() with a realistic hit ratio in both directions, since isin performance can
+    # differ between an all-miss workload and one with a mix of hits and misses.
+    currency_schema_str = "col1_currency_code: string, col2_currency_code: string"
+    schema = _parse_datatype_string(currency_schema_str)
+
+    currency_value_lists = {
+        "col1_currency_code": ["USD", "EUR", "JPY", "GBP", "AUD", "AAA"],
+        "col2_currency_code": ["AAA", "KKK", "ZZZ", "USD"],
+    }
+
+    _, gen = make_data_gen(
+        spark, n_rows=DEFAULT_ROWS, n_columns=len(currency_value_lists), partitions=DEFAULT_PARTITIONS
+    )
+    gen = gen.withSchema(schema)
+    for col, values in currency_value_lists.items():
+        gen = gen.withColumnSpec(col, values=values)
+
+    return gen.build()
+
+
+@pytest.fixture
+def generated_subdivision_code_df(spark):
+    # Mostly-valid vs mostly-invalid mixes (rather than a single fixed value) so the benchmark
+    # exercises isin() with a realistic hit ratio in both directions, since isin performance can
+    # differ between an all-miss workload and one with a mix of hits and misses.
+    subdivision_schema_str = "col1_subdivision_code: string, col2_subdivision_code: string"
+    schema = _parse_datatype_string(subdivision_schema_str)
+
+    subdivision_value_lists = {
+        "col1_subdivision_code": ["US-CA", "US-NY", "GB-ENG", "DE-BY", "FR-75C", "US-ZZ"],
+        "col2_subdivision_code": ["US-ZZ", "XX-YY", "GB-ZZZ", "US-CA"],
+    }
+
+    _, gen = make_data_gen(
+        spark, n_rows=DEFAULT_ROWS, n_columns=len(subdivision_value_lists), partitions=DEFAULT_PARTITIONS
+    )
+    gen = gen.withSchema(schema)
+    for col, values in subdivision_value_lists.items():
+        gen = gen.withColumnSpec(col, values=values)
+
+    return gen.build()
+
+
+@pytest.fixture
+def generated_language_code_df(spark):
+    # Mostly-valid vs mostly-invalid mixes (rather than a single fixed value) so the benchmark
+    # exercises isin() with a realistic hit ratio in both directions, since isin performance can
+    # differ between an all-miss workload and one with a mix of hits and misses.
+    language_schema_str = "col1_language_code: string, col2_language_code: string"
+    schema = _parse_datatype_string(language_schema_str)
+
+    language_value_lists = {
+        "col1_language_code": ["en", "fr", "de", "ja", "zh", "xx"],
+        "col2_language_code": ["xx", "qq", "zz", "en"],
+    }
+
+    _, gen = make_data_gen(
+        spark, n_rows=DEFAULT_ROWS, n_columns=len(language_value_lists), partitions=DEFAULT_PARTITIONS
+    )
+    gen = gen.withSchema(schema)
+    for col, values in language_value_lists.items():
+        gen = gen.withColumnSpec(col, values=values)
+
+    return gen.build()

@@ -24,15 +24,12 @@ We need extremely tight control over:
   doesn't need a dialect branch.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import os
 import random
 import threading
-import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -54,7 +51,15 @@ from databricks_labs_dqx_app.backend.pg_cursor_helpers import (
     run_parameterized_sql,
     run_trusted_sql,
 )
-from databricks_labs_dqx_app.backend.sql_executor import RawSql, _render_value
+from databricks_labs_dqx_app.backend.sql_executor import (
+    RawSql,
+    _build_count,
+    _build_delete,
+    _build_insert,
+    _build_select,
+    _build_update,
+    _render_value,
+)
 from databricks_labs_dqx_app.backend.sql_utils import escape_sql_string
 
 logger = logging.getLogger(__name__)
@@ -94,14 +99,18 @@ class _TokenHolder:
             self._token = value
 
 
-def _generate_token(ws: WorkspaceClient, instance_name: str) -> str:
-    """Generate a fresh Lakebase OAuth token (1-hour TTL)."""
-    cred = ws.database.generate_database_credential(
-        request_id=str(uuid.uuid4()),
-        instance_names=[instance_name],
-    )
+def _generate_token(ws: WorkspaceClient, endpoint: str) -> str:
+    """Generate a fresh Lakebase OAuth token (1-hour TTL) for *endpoint*.
+
+    Endpoint-scoped credential generation (the Lakebase *projects* model):
+    *endpoint* is a full resource path, e.g.
+    ``projects/dqx-studio-db/branches/dev/endpoints/primary``. This is the
+    same value passed to :meth:`WorkspaceClient.postgres.get_endpoint`, so
+    host resolution and credential issuance stay in lockstep.
+    """
+    cred = ws.postgres.generate_database_credential(endpoint=endpoint)
     if not cred.token:
-        raise RuntimeError(f"Lakebase credential response had no token (instance={instance_name})")
+        raise RuntimeError(f"Lakebase credential response had no token (endpoint={endpoint})")
     return cred.token
 
 
@@ -164,11 +173,17 @@ class PgExecutor:
 
     dialect: str = "postgres"
 
+    # Alias applied to the conflict target in :meth:`upsert_with_audit` so a
+    # self-referencing increment can address the existing row without a
+    # schema-qualified reference (which Postgres rejects in DO UPDATE SET).
+    # Deliberately prefixed to avoid colliding with any real relation name.
+    _UPSERT_TARGET_ALIAS: str = "dqx_upsert_target"
+
     def __init__(
         self,
         *,
         ws: WorkspaceClient,
-        instance_name: str,
+        endpoint: str,
         database: str,
         schema: str,
         username: str,
@@ -182,7 +197,7 @@ class PgExecutor:
         pool_max_size: int = 10,
     ) -> None:
         self._ws = ws
-        self._instance_name = instance_name
+        self._endpoint = endpoint
         self._database = database
         self._schema = schema
         self._username = username
@@ -206,7 +221,7 @@ class PgExecutor:
         # counts as a successful refresh — the metric / counter start
         # in the "healthy" state, not a transient "never refreshed"
         # one that would confuse a health endpoint at t=0.
-        self._token_holder = _TokenHolder(_generate_token(ws, instance_name))
+        self._token_holder = _TokenHolder(_generate_token(ws, endpoint))
         self._last_successful_refresh_at: datetime | None = datetime.now(timezone.utc)
         self._consecutive_refresh_failures: int = 0
 
@@ -228,8 +243,20 @@ class PgExecutor:
 
         # ``max_lifetime`` recycles connections every 50 minutes which
         # ensures we never hand out a connection authenticated with a
-        # near-expired token. ``check`` runs ``SELECT 1`` on idle pool
-        # members so a server-side disconnect doesn't poison the pool.
+        # near-expired token.
+        #
+        # ``check=check_connection`` is the psycopg-pool equivalent of
+        # SQLAlchemy's ``pool_pre_ping=True``: on every checkout the pool
+        # runs a lightweight ``SELECT 1`` and, if it fails, discards the
+        # dead connection and transparently opens a fresh one (backing
+        # off until ``timeout``). This is load-bearing for the Lakebase
+        # *projects* endpoint, which scales to zero after
+        # ``suspend_timeout_duration`` of inactivity — suspension kills
+        # every pooled connection, so without pre-ping the first request
+        # after an idle period would fail. Instead the check discards the
+        # dead connection and the fresh connect re-auths with the current
+        # OAuth token (read from ``_connect_kwargs['password']``, which
+        # the refresh loop keeps current) and resumes the endpoint.
         self._pool: ConnectionPool = ConnectionPool(
             conninfo="",
             min_size=pool_min_size,
@@ -278,6 +305,11 @@ class PgExecutor:
     @property
     def schema(self) -> str:
         return self._schema
+
+    @property
+    def username(self) -> str:
+        """Postgres role the pool authenticates as (SP client id in production)."""
+        return self._username
 
     @property
     def database(self) -> str:
@@ -465,6 +497,109 @@ class PgExecutor:
                 cols = [d.name for d in (cur.description or [])]
         return [{col: _to_text(cell) for col, cell in zip(cols, row)} for row in rows]
 
+    # ------------------------------------------------------------------
+    # CRUD-builder shortcuts (Protocol contract)
+    # ------------------------------------------------------------------
+
+    def insert(
+        self,
+        table: str,
+        *,
+        values: dict[str, Any],
+        timeout_seconds: int = 120,
+    ) -> None:
+        """Postgres ``INSERT INTO <table> (<cols>) VALUES (<vals>)``.
+
+        See :meth:`OltpExecutorProtocol.insert` for the contract.
+        Values are rendered via :func:`_pg_render_value` so
+        ``RawSql("current_timestamp()")`` is translated to Postgres'
+        ``CURRENT_TIMESTAMP``.
+        """
+        self.execute(
+            _build_insert(table, values, self.q, _pg_render_value),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def update(
+        self,
+        table: str,
+        *,
+        updates: dict[str, Any],
+        where: dict[str, Any],
+        timeout_seconds: int = 120,
+    ) -> None:
+        """Postgres ``UPDATE <table> SET <updates> WHERE <where>``.
+
+        See :meth:`OltpExecutorProtocol.update` for the contract.
+        """
+        self.execute(
+            _build_update(table, updates, where, self.q, _pg_render_value),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def delete(
+        self,
+        table: str,
+        *,
+        where: dict[str, Any],
+        timeout_seconds: int = 120,
+    ) -> None:
+        """Postgres ``DELETE FROM <table> WHERE <where>``.
+
+        See :meth:`OltpExecutorProtocol.delete` for the contract.
+        """
+        self.execute(
+            _build_delete(table, where, self.q, _pg_render_value),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def count(
+        self,
+        table: str,
+        *,
+        where: dict[str, Any] | None = None,
+        timeout_seconds: int = 120,
+    ) -> int:
+        """Postgres ``SELECT COUNT(*) FROM <table> [WHERE <where>]``.
+
+        See :meth:`OltpExecutorProtocol.count` for the contract.
+        """
+        rows = self.query(
+            _build_count(table, where, self.q, _pg_render_value),
+            timeout_seconds=timeout_seconds,
+        )
+        if rows and rows[0] and rows[0][0] is not None:
+            return int(rows[0][0])
+        return 0
+
+    def select_rows(
+        self,
+        table: str,
+        columns: Sequence[str],
+        *,
+        where: dict[str, Any] | None = None,
+        timeout_seconds: int = 120,
+    ) -> list[list[str]]:
+        """Postgres simple SELECT — see :meth:`OltpExecutorProtocol.select_rows`."""
+        return self.query(
+            _build_select(table, columns, where, self.q, _pg_render_value),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def select_dicts(
+        self,
+        table: str,
+        columns: Sequence[str],
+        *,
+        where: dict[str, Any] | None = None,
+        timeout_seconds: int = 120,
+    ) -> list[dict[str, str | None]]:
+        """Postgres simple SELECT — see :meth:`OltpExecutorProtocol.select_dicts`."""
+        return self.query_dicts(
+            _build_select(table, columns, where, self.q, _pg_render_value),
+            timeout_seconds=timeout_seconds,
+        )
+
     def upsert(
         self,
         table: str,
@@ -515,9 +650,19 @@ class PgExecutor:
         """Postgres ``INSERT ... ON CONFLICT ... DO UPDATE`` with audit semantics.
 
         See :meth:`backend.sql_executor.OltpExecutorProtocol.upsert_with_audit`
-        for the contract. The increment self-reference uses the bare
-        column form (``"col" + 1``) which Postgres resolves against
-        the existing row inside DO UPDATE — no table prefix needed.
+        for the contract. The increment self-reference must point at the
+        *existing* row (not ``EXCLUDED``, which carries the proposed
+        value). A bare column name (``"col" = "col" + 1``) is ambiguous
+        when the same column also appears in ``EXCLUDED``, but a
+        schema-qualified reference (``"dq"."tbl"."col"``) is **not** a
+        valid existing-row reference inside ``DO UPDATE SET`` — Postgres
+        resolves it as a FROM-clause entry and errors with "invalid
+        reference to FROM-clause entry for table ...". We therefore alias
+        the conflict target (``INSERT INTO <fqn> AS <alias>``, supported
+        since the ON CONFLICT feature shipped in PG 9.5) and reference the
+        alias, which resolves unambiguously to the existing row. Aliasing
+        also sidesteps having to recover the bare relation name from the
+        already-quoted FQN string.
         """
         if not key_cols:
             raise ValueError("upsert_with_audit requires at least one key column")
@@ -531,19 +676,25 @@ class PgExecutor:
         all_vals = [_pg_render_value(v) for v in list(key_cols.values()) + list(value_cols.values())]
         quoted_cols = [self.q(c) for c in all_cols]
         quoted_keys = [self.q(c) for c in key_cols]
+        alias = self.q(self._UPSERT_TARGET_ALIAS)
 
         # DO UPDATE SET excludes created_* columns when preserve_created;
-        # the increment column (if any) gets the bare-column
-        # self-reference form Postgres resolves inside ON CONFLICT DO
-        # UPDATE — no table prefix needed.
+        # the increment column (if any) references the aliased conflict
+        # target so it resolves to the existing row rather than EXCLUDED.
         update_pairs: list[str] = []
+        needs_alias = False
         for col, val in value_cols.items():
             if preserve_created and col.startswith("created_"):
                 continue
             qcol = self.q(col)
             if col == increment_on_update:
-                # Bare column reference resolves to the existing row.
-                update_pairs.append(f"{qcol} = {qcol} + 1")
+                # Alias-qualified reference resolves unambiguously to the
+                # existing row — even when ``EXCLUDED`` also exposes the
+                # same column name (which is always the case for
+                # ``increment_on_update`` since it has to be in
+                # ``value_cols``).
+                update_pairs.append(f"{qcol} = {alias}.{qcol} + 1")
+                needs_alias = True
             else:
                 update_pairs.append(f"{qcol} = {_pg_render_value(val)}")
 
@@ -555,7 +706,12 @@ class PgExecutor:
             # "create-if-missing" audit row).
             conflict_clause = f"ON CONFLICT ({', '.join(quoted_keys)}) DO NOTHING"
 
-        sql = f"INSERT INTO {table} ({', '.join(quoted_cols)}) " f"VALUES ({', '.join(all_vals)}) " f"{conflict_clause}"
+        # Only alias the target when a self-reference needs it, so the
+        # non-increment path keeps its existing rendered shape.
+        target = f"{table} AS {alias}" if needs_alias else table
+        sql = (
+            f"INSERT INTO {target} ({', '.join(quoted_cols)}) " f"VALUES ({', '.join(all_vals)}) " f"{conflict_clause}"
+        )
         self.execute(sql, timeout_seconds=timeout_seconds)
 
     def select_json_text(self, col: str) -> str:
@@ -642,11 +798,11 @@ class PgExecutor:
         """
         logger.critical(
             "Lakebase token refresh failed %d times in a row; exiting so the "
-            "supervisor restarts the worker (instance=%s, last_success=%s). "
+            "supervisor restarts the worker (endpoint=%s, last_success=%s). "
             "Continuing would silently drain the pool when ``max_lifetime`` "
             "starts recycling connections without a valid replacement token.",
             self._consecutive_refresh_failures,
-            self._instance_name,
+            self._endpoint,
             self._last_successful_refresh_at.isoformat() if self._last_successful_refresh_at else None,
         )
         # ``os._exit`` skips atexit / signal handlers so it cannot
@@ -679,7 +835,7 @@ class PgExecutor:
             if self._stop.wait(self._next_wait_seconds()):
                 return
             try:
-                fresh = _generate_token(self._ws, self._instance_name)
+                fresh = _generate_token(self._ws, self._endpoint)
                 self._token_holder.token = fresh
                 # Mutating the same dict the pool was constructed with
                 # is the supported way to inject rotating credentials
@@ -723,7 +879,7 @@ class PgExecutor:
 def build_pg_executor(
     ws: WorkspaceClient,
     *,
-    instance_name: str,
+    endpoint: str,
     database: str,
     schema: str,
     token_refresh_minutes: int = 50,
@@ -735,18 +891,22 @@ def build_pg_executor(
 ) -> PgExecutor:
     """Construct a :class:`PgExecutor` from a Databricks workspace client.
 
-    Resolves the instance's read/write DNS endpoint and the calling
-    identity's username (service principal in production, real user
-    locally) before opening the pool. The token-refresh tuning
+    Resolves the read/write DNS host for the Lakebase *endpoint* (the
+    projects-model endpoint resource path, e.g.
+    ``projects/dqx-studio-db/branches/dev/endpoints/primary``) and the
+    calling identity's username (service principal in production, real
+    user locally) before opening the pool. The token-refresh tuning
     kwargs are passed straight through to :class:`PgExecutor` — see
     its :meth:`__init__` and :meth:`_token_refresh_loop` for the
     full back-off / escalation contract.
     """
-    instance = ws.database.get_database_instance(name=instance_name)
-    host = instance.read_write_dns
+    endpoint_obj = ws.postgres.get_endpoint(name=endpoint)
+    status = endpoint_obj.status
+    host = status.hosts.host if status and status.hosts else None
     if not host:
         raise RuntimeError(
-            f"Lakebase instance {instance_name!r} has no read_write_dns. " "Is it provisioned and running?"
+            f"Lakebase endpoint {endpoint!r} has no read/write host. "
+            "Is the project branch/endpoint provisioned and running?"
         )
 
     me = ws.current_user.me()
@@ -756,7 +916,7 @@ def build_pg_executor(
 
     return PgExecutor(
         ws=ws,
-        instance_name=instance_name,
+        endpoint=endpoint,
         database=database,
         schema=schema,
         username=username,

@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from datetime import datetime
 
@@ -7,7 +8,13 @@ from pyspark.sql.types import StructType, StructField, IntegerType, StringType
 from pyspark.testing.utils import assertDataFrameEqual
 
 from databricks.sdk.errors import NotFound
-from databricks.labs.dqx.config import InputConfig, OutputConfig, ExtraParams
+from databricks.labs.dqx.config import (
+    InputConfig,
+    OutputConfig,
+    ExtraParams,
+    RunConfig,
+    TableChecksStorageConfig,
+)
 from databricks.labs.dqx.checks_serializer import deserialize_checks
 from databricks.labs.dqx.rule_fingerprint import compute_rule_set_fingerprint_by_metadata
 from databricks.labs.dqx.engine import DQEngine
@@ -15,7 +22,7 @@ from databricks.labs.dqx.metrics_observer import DQMetricsObserver, OBSERVATION_
 from databricks.labs.dqx.reporting_columns import ColumnArguments
 
 from tests.constants import TEST_CATALOG
-from tests.integration.conftest import EXTRA_PARAMS
+from tests.integration.conftest import EXTRA_PARAMS, RUN_TIME
 
 # Test constants
 TEST_SCHEMA = StructType(
@@ -217,50 +224,6 @@ def test_observer_custom_metrics(ws, spark, apply_checks_method):
         "avg_error_age": 35.0,
         "total_warning_salary": 55000,
     }
-
-
-@pytest.mark.parametrize(
-    "apply_checks_method",
-    [DQEngine.apply_checks_and_save_in_table, DQEngine.apply_checks_by_metadata_and_save_in_table],
-)
-def test_engine_without_observer_no_metrics_saved(ws, spark, make_schema, make_random, apply_checks_method):
-    """Test that no metrics are saved when observer is not configured."""
-    catalog_name = TEST_CATALOG
-    schema = make_schema(catalog_name=catalog_name)
-    input_table_name = f"{catalog_name}.{schema.name}.input_{make_random(6).lower()}"
-    output_table_name = f"{catalog_name}.{schema.name}.output_{make_random(6).lower()}"
-    metrics_table_name = f"{catalog_name}.{schema.name}.metrics_{make_random(6).lower()}"
-
-    dq_engine = DQEngine(workspace_client=ws, spark=spark, extra_params=EXTRA_PARAMS)
-
-    test_df = spark.createDataFrame(
-        [
-            [1, "Alice", 30, 50000],
-            [2, "Bob", 25, 45000],
-        ],
-        TEST_SCHEMA,
-    )
-
-    test_df.write.saveAsTable(input_table_name)
-
-    input_config = InputConfig(location=input_table_name)
-    output_config = OutputConfig(location=output_table_name, mode="overwrite")
-    metrics_config = OutputConfig(location=metrics_table_name, mode="overwrite")
-
-    if apply_checks_method == DQEngine.apply_checks_and_save_in_table:
-        checks = deserialize_checks(TEST_CHECKS)
-        dq_engine.apply_checks_and_save_in_table(
-            checks=checks, input_config=input_config, output_config=output_config, metrics_config=metrics_config
-        )
-    elif apply_checks_method == DQEngine.apply_checks_by_metadata_and_save_in_table:
-        dq_engine.apply_checks_by_metadata_and_save_in_table(
-            checks=TEST_CHECKS, input_config=input_config, output_config=output_config, metrics_config=metrics_config
-        )
-    else:
-        raise ValueError("Invalid 'apply_checks_method' used for testing observable metrics.")
-
-    with pytest.raises(NotFound):
-        ws.tables.get(full_name=metrics_table_name)
 
 
 def test_save_summary_metrics(ws, spark, make_schema, make_random):
@@ -559,18 +522,22 @@ def test_save_summary_metrics_with_streaming_and_custom_params(ws, spark, make_s
     schema_name = make_schema(catalog_name=TEST_CATALOG).name
     volume_name = make_volume(catalog_name=TEST_CATALOG, schema_name=schema_name).name
 
-    input_config = InputConfig(location=f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}", is_streaming=True)
+    input_config = InputConfig(
+        location=f"{TEST_CATALOG}.{schema_name}.input_{make_random(6).lower()}", is_streaming=True
+    )
     output_config = OutputConfig(
-        location=f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}",
+        location=f"{TEST_CATALOG}.{schema_name}.output_{make_random(6).lower()}",
         options={"checkPointLocation": f"/Volumes/{TEST_CATALOG}/{schema_name}/{volume_name}/{make_random(6).lower()}"},
         trigger={"availableNow": True},
     )
     quarantine_config = OutputConfig(
-        location=f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}",
+        location=f"{TEST_CATALOG}.{schema_name}.quarantine_{make_random(6).lower()}",
         options={"checkPointLocation": f"/Volumes/{TEST_CATALOG}/{schema_name}/{volume_name}/{make_random(6).lower()}"},
         trigger={"availableNow": True},
     )
-    metrics_config = OutputConfig(location=f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}", mode="overwrite")
+    metrics_config = OutputConfig(
+        location=f"{TEST_CATALOG}.{schema_name}.metrics_{make_random(6).lower()}", mode="overwrite"
+    )
 
     user_metadata = {"key1": "value1", "key2": "value2"}
     dq_engine = DQEngine(
@@ -760,9 +727,9 @@ def test_observer_metrics_output_with_empty_checks(
     # NOTE: This test is skipped during the 'integration' workflow. Data quality summary metrics are not supported on classic compute in Dedicated access mode for DBR versions < 17.
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    input_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
 
     custom_metrics = [
         "avg(case when _errors is not null then age else null end) as avg_error_age",
@@ -911,10 +878,10 @@ def test_observer_metrics_output_with_quarantine_with_empty_checks(
     # NOTE: This test is skipped during the 'integration' workflow. Data quality summary metrics are not supported on classic compute in Dedicated access mode for DBR versions < 17.
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    input_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    quarantine_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
 
     custom_metrics = [
         "avg(case when _errors is not null then age else null end) as avg_error_age",
@@ -1069,9 +1036,9 @@ def test_observer_metrics_output(skip_if_classic_compute, apply_checks_method, s
     # NOTE: This test is skipped during the 'integration' workflow. Data quality summary metrics are not supported on classic compute in Dedicated access mode for DBR versions < 17.
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    input_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
 
     custom_metrics = [
         "avg(case when _errors is not null then age else null end) as avg_error_age",
@@ -1244,10 +1211,10 @@ def test_observer_metrics_output_with_quarantine(
 ):
     # NOTE: This test is skipped during the 'integration' workflow. Data quality summary metrics are not supported on classic compute in Dedicated access mode for DBR versions < 17.
     schema_name = make_schema(catalog_name=TEST_CATALOG).name
-    input_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
 
     custom_metrics = [
         "avg(case when _errors is not null then age else null end) as avg_error_age",
@@ -1418,6 +1385,279 @@ def test_observer_metrics_output_with_quarantine(
 
 @pytest.mark.parametrize(
     "apply_checks_method",
+    [DQEngine.apply_checks_and_save_in_table, DQEngine.apply_checks_by_metadata_and_save_in_table],
+)
+def test_observer_metrics_output_with_quarantine_only(
+    skip_if_classic_compute, apply_checks_method, spark, ws, make_schema, make_random
+):
+    # NOTE: This test is skipped during the 'integration' workflow. Data quality summary metrics are not supported on classic compute in Dedicated access mode for DBR versions < 17.
+    schema_name = make_schema(catalog_name=TEST_CATALOG).name
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+
+    custom_metrics = [
+        "avg(case when _errors is not null then age else null end) as avg_error_age",
+        "sum(case when _warnings is not null then salary else null end) as total_warning_salary",
+    ]
+    observer = DQMetricsObserver(name="test_observer", custom_metrics=custom_metrics)
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    test_df = spark.createDataFrame(
+        [
+            [1, "Alice", 30, 50000],
+            [2, "Bob", 25, 45000],
+            [None, "Charlie", 35, 60000],
+            [4, None, 28, 55000],
+        ],
+        TEST_SCHEMA,
+    )
+
+    test_df.write.saveAsTable(input_table_name)
+    input_config = InputConfig(location=input_table_name)
+    quarantine_config = OutputConfig(location=quarantine_table_name, mode="overwrite")
+    metrics_config = OutputConfig(location=metrics_table_name, mode="overwrite")
+    checks_location = "fake.yml"
+
+    if apply_checks_method == DQEngine.apply_checks_and_save_in_table:
+        checks = deserialize_checks(TEST_CHECKS)
+        dq_engine.apply_checks_and_save_in_table(
+            checks=checks,
+            input_config=input_config,
+            quarantine_config=quarantine_config,
+            metrics_config=metrics_config,
+            checks_location=checks_location,
+        )
+    elif apply_checks_method == DQEngine.apply_checks_by_metadata_and_save_in_table:
+        dq_engine.apply_checks_by_metadata_and_save_in_table(
+            checks=TEST_CHECKS,
+            input_config=input_config,
+            quarantine_config=quarantine_config,
+            metrics_config=metrics_config,
+            checks_location=checks_location,
+        )
+    else:
+        raise ValueError("Invalid 'apply_checks_method' used for testing observable metrics.")
+
+    expected_metrics = [
+        {
+            "run_id": EXTRA_PARAMS.run_id_overwrite,
+            "run_name": "test_observer",
+            "input_location": input_table_name,
+            "output_location": None,
+            "quarantine_location": quarantine_table_name,
+            "checks_location": checks_location,
+            "rule_set_fingerprint": TEST_CHECKS_RULE_SET_FINGERPRINT,
+            "metric_name": "input_row_count",
+            "metric_value": "4",
+            "run_time": datetime.fromisoformat(EXTRA_PARAMS.run_time_overwrite),
+            "error_column_name": "_errors",
+            "warning_column_name": "_warnings",
+            "user_metadata": None,
+        },
+        {
+            "run_id": EXTRA_PARAMS.run_id_overwrite,
+            "run_name": "test_observer",
+            "input_location": input_table_name,
+            "output_location": None,
+            "quarantine_location": quarantine_table_name,
+            "checks_location": checks_location,
+            "rule_set_fingerprint": TEST_CHECKS_RULE_SET_FINGERPRINT,
+            "metric_name": "error_row_count",
+            "metric_value": "1",
+            "run_time": datetime.fromisoformat(EXTRA_PARAMS.run_time_overwrite),
+            "error_column_name": "_errors",
+            "warning_column_name": "_warnings",
+            "user_metadata": None,
+        },
+        {
+            "run_id": EXTRA_PARAMS.run_id_overwrite,
+            "run_name": "test_observer",
+            "input_location": input_table_name,
+            "output_location": None,
+            "quarantine_location": quarantine_table_name,
+            "checks_location": checks_location,
+            "rule_set_fingerprint": TEST_CHECKS_RULE_SET_FINGERPRINT,
+            "metric_name": "warning_row_count",
+            "metric_value": "1",
+            "run_time": datetime.fromisoformat(EXTRA_PARAMS.run_time_overwrite),
+            "error_column_name": "_errors",
+            "warning_column_name": "_warnings",
+            "user_metadata": None,
+        },
+        {
+            "run_id": EXTRA_PARAMS.run_id_overwrite,
+            "run_name": "test_observer",
+            "input_location": input_table_name,
+            "output_location": None,
+            "quarantine_location": quarantine_table_name,
+            "checks_location": checks_location,
+            "rule_set_fingerprint": TEST_CHECKS_RULE_SET_FINGERPRINT,
+            "metric_name": "valid_row_count",
+            "metric_value": "2",
+            "run_time": datetime.fromisoformat(EXTRA_PARAMS.run_time_overwrite),
+            "error_column_name": "_errors",
+            "warning_column_name": "_warnings",
+            "user_metadata": None,
+        },
+        {
+            "run_id": EXTRA_PARAMS.run_id_overwrite,
+            "run_name": "test_observer",
+            "input_location": input_table_name,
+            "output_location": None,
+            "quarantine_location": quarantine_table_name,
+            "checks_location": checks_location,
+            "rule_set_fingerprint": TEST_CHECKS_RULE_SET_FINGERPRINT,
+            "metric_name": "avg_error_age",
+            "metric_value": "35.0",
+            "run_time": datetime.fromisoformat(EXTRA_PARAMS.run_time_overwrite),
+            "error_column_name": "_errors",
+            "warning_column_name": "_warnings",
+            "user_metadata": None,
+        },
+        {
+            "run_id": EXTRA_PARAMS.run_id_overwrite,
+            "run_name": "test_observer",
+            "input_location": input_table_name,
+            "output_location": None,
+            "quarantine_location": quarantine_table_name,
+            "checks_location": checks_location,
+            "rule_set_fingerprint": TEST_CHECKS_RULE_SET_FINGERPRINT,
+            "metric_name": "total_warning_salary",
+            "metric_value": "55000",
+            "run_time": datetime.fromisoformat(EXTRA_PARAMS.run_time_overwrite),
+            "error_column_name": "_errors",
+            "warning_column_name": "_warnings",
+            "user_metadata": None,
+        },
+        {
+            "run_id": EXTRA_PARAMS.run_id_overwrite,
+            "run_name": "test_observer",
+            "input_location": input_table_name,
+            "output_location": None,
+            "quarantine_location": quarantine_table_name,
+            "checks_location": checks_location,
+            "rule_set_fingerprint": TEST_CHECKS_RULE_SET_FINGERPRINT,
+            "metric_name": "check_metrics",
+            "metric_value": TEST_CHECK_METRICS_VALUE,
+            "run_time": datetime.fromisoformat(EXTRA_PARAMS.run_time_overwrite),
+            "error_column_name": "_errors",
+            "warning_column_name": "_warnings",
+            "user_metadata": None,
+        },
+    ]
+
+    expected_metrics_df = spark.createDataFrame(expected_metrics, schema=OBSERVATION_TABLE_SCHEMA).orderBy(
+        "metric_name"
+    )
+    actual_metrics_df = spark.table(metrics_table_name).orderBy("metric_name")
+    assertDataFrameEqual(expected_metrics_df, actual_metrics_df)
+    assert (
+        spark.table(quarantine_config.location).count() == 2
+    ), f"Quarantine table {quarantine_config.location} has {spark.table(quarantine_config.location).count()} rows"
+
+
+def test_observer_metrics_workflow_with_quarantine_only(skip_if_classic_compute, spark, ws, make_schema, make_random):
+    # NOTE: This test is skipped during the 'integration' workflow. Data quality summary metrics are not supported on classic compute in Dedicated access mode for DBR versions < 17.
+    schema_name = make_schema(catalog_name=TEST_CATALOG).name
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    checks_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+
+    observer = DQMetricsObserver(name="test_observer")
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    test_df = spark.createDataFrame(
+        [
+            [1, "Alice", 30, 50000],
+            [2, "Bob", 25, 45000],
+            [None, "Charlie", 35, 60000],
+            [4, None, 28, 55000],
+        ],
+        TEST_SCHEMA,
+    )
+    test_df.write.saveAsTable(input_table_name)
+
+    dq_engine.save_checks(TEST_CHECKS, config=TableChecksStorageConfig(location=checks_table_name))
+
+    run_config = RunConfig(
+        input_config=InputConfig(location=input_table_name),
+        quarantine_config=OutputConfig(location=quarantine_table_name, mode="overwrite"),
+        metrics_config=OutputConfig(location=metrics_table_name, mode="overwrite"),
+        checks_location=checks_table_name,
+    )
+    dq_engine.apply_checks_and_save_in_tables(run_configs=[run_config])
+
+    metric_names = {row["metric_name"] for row in spark.table(metrics_table_name).collect()}
+    assert metric_names == {
+        "input_row_count",
+        "error_row_count",
+        "warning_row_count",
+        "valid_row_count",
+        "check_metrics",
+    }
+
+    output_locations = {row["output_location"] for row in spark.table(metrics_table_name).collect()}
+    assert output_locations == {None}
+
+    quarantine_locations = {row["quarantine_location"] for row in spark.table(metrics_table_name).collect()}
+    assert quarantine_locations == {quarantine_table_name}
+
+    assert (
+        spark.table(quarantine_table_name).count() == 2
+    ), f"Quarantine table {quarantine_table_name} has {spark.table(quarantine_table_name).count()} rows"
+
+
+def test_observer_metrics_workflow_metrics_only(skip_if_classic_compute, spark, ws, make_schema, make_random):
+    # NOTE: This test is skipped during the 'integration' workflow. Data quality summary metrics are not supported on classic compute in Dedicated access mode for DBR versions < 17.
+    schema_name = make_schema(catalog_name=TEST_CATALOG).name
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    checks_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+
+    observer = DQMetricsObserver(name="test_observer")
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    test_df = spark.createDataFrame(
+        [
+            [1, "Alice", 30, 50000],
+            [2, "Bob", 25, 45000],
+            [None, "Charlie", 35, 60000],
+            [4, None, 28, 55000],
+        ],
+        TEST_SCHEMA,
+    )
+    test_df.write.saveAsTable(input_table_name)
+
+    dq_engine.save_checks(TEST_CHECKS, config=TableChecksStorageConfig(location=checks_table_name))
+
+    run_config = RunConfig(
+        input_config=InputConfig(location=input_table_name),
+        metrics_config=OutputConfig(location=metrics_table_name, mode="overwrite"),
+        checks_location=checks_table_name,
+    )
+    dq_engine.apply_checks_and_save_in_tables(run_configs=[run_config])
+
+    metrics_rows = spark.table(metrics_table_name).collect()
+    metric_names = {row["metric_name"] for row in metrics_rows}
+    assert metric_names == {
+        "input_row_count",
+        "error_row_count",
+        "warning_row_count",
+        "valid_row_count",
+        "check_metrics",
+    }
+
+    output_locations = {row["output_location"] for row in metrics_rows}
+    assert output_locations == {None}
+
+    quarantine_locations = {row["quarantine_location"] for row in metrics_rows}
+    assert quarantine_locations == {None}
+
+
+@pytest.mark.parametrize(
+    "apply_checks_method",
     [DQEngine.apply_checks_and_split, DQEngine.apply_checks_by_metadata_and_split],
 )
 def test_save_results_in_table_batch_with_metrics(
@@ -1426,9 +1666,9 @@ def test_save_results_in_table_batch_with_metrics(
     # NOTE: This test is skipped during the 'integration' workflow. Data quality summary metrics are not supported on classic compute in Dedicated access mode for DBR versions < 17.
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    output_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    quarantine_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
+    output_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
 
     observer = DQMetricsObserver(name="test_save_batch_observer")
     dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
@@ -1556,15 +1796,104 @@ def test_save_results_in_table_batch_with_metrics(
     ), f"Quarantine table {quarantine_config.location} has {spark.table(quarantine_config.location).count()} rows"
 
 
+def test_save_results_in_table_batch_metrics_only(skip_if_classic_compute, spark, ws, make_schema, make_random):
+    schema_name = make_schema(catalog_name=TEST_CATALOG).name
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+
+    observer = DQMetricsObserver(name="test_save_batch_observer")
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    test_df = spark.createDataFrame(
+        [
+            [1, "Alice", 30, 50000],
+            [2, "Bob", 25, 45000],
+            [None, "Charlie", 35, 60000],
+            [4, None, 28, 55000],
+        ],
+        TEST_SCHEMA,
+    )
+
+    checked_df, observation = dq_engine.apply_checks_by_metadata(test_df, TEST_CHECKS)
+    checked_df.count()
+
+    dq_engine.save_results_in_table(
+        observation=observation,
+        metrics_config=OutputConfig(location=metrics_table_name, mode="overwrite"),
+        rule_set_fingerprint=TEST_CHECKS_RULE_SET_FINGERPRINT,
+    )
+
+    metrics_rows = spark.table(metrics_table_name).collect()
+    metric_names = {row["metric_name"] for row in metrics_rows}
+    assert metric_names == {
+        "input_row_count",
+        "error_row_count",
+        "warning_row_count",
+        "valid_row_count",
+        "check_metrics",
+    }
+
+    output_locations = {row["output_location"] for row in metrics_rows}
+    assert output_locations == {None}
+
+    quarantine_locations = {row["quarantine_location"] for row in metrics_rows}
+    assert quarantine_locations == {None}
+
+
+@pytest.mark.usefixtures("skip_if_classic_compute")
+def test_save_results_in_table_batch_metrics_only_without_observer(spark, ws, make_schema, make_random, caplog):
+    schema_name = make_schema(catalog_name=TEST_CATALOG).name
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+
+    observer = DQMetricsObserver(name="test_save_batch_observer")
+    observed_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    test_df = spark.createDataFrame(
+        [
+            [1, "Alice", 30, 50000],
+            [2, "Bob", 25, 45000],
+            [None, "Charlie", 35, 60000],
+            [4, None, 28, 55000],
+        ],
+        TEST_SCHEMA,
+    )
+
+    checked_df, observation = observed_engine.apply_checks_by_metadata(test_df, TEST_CHECKS)
+    checked_df.count()
+
+    save_engine = DQEngine(workspace_client=ws, spark=spark, extra_params=EXTRA_PARAMS)
+    with caplog.at_level(logging.INFO, logger="databricks.labs.dqx.engine"):
+        save_engine.save_results_in_table(
+            observation=observation,
+            metrics_config=OutputConfig(location=metrics_table_name, mode="overwrite"),
+            rule_set_fingerprint=TEST_CHECKS_RULE_SET_FINGERPRINT,
+        )
+
+    metrics_rows = spark.table(metrics_table_name).collect()
+    metric_names = {row["metric_name"] for row in metrics_rows}
+    assert metric_names == {
+        "input_row_count",
+        "error_row_count",
+        "warning_row_count",
+        "valid_row_count",
+        "check_metrics",
+    }
+    rule_set_fingerprints = {row["rule_set_fingerprint"] for row in metrics_rows}
+    assert rule_set_fingerprints == {TEST_CHECKS_RULE_SET_FINGERPRINT}
+    # The saving engine has no observer, so run_name is null (not a fabricated default observer name)
+    # and an info log makes the null run_name visible to the user.
+    assert {row["run_name"] for row in metrics_rows} == {None}
+    assert "No observer configured on this engine; run_name will be null" in caplog.text
+
+
 def test_save_results_in_table_batch_with_rule_set_fingerprint(
     skip_if_classic_compute, spark, ws, make_schema, make_random
 ):
     """Verify that rule_set_fingerprint passed to save_results_in_table is written to the metrics table."""
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    output_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    quarantine_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
+    output_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
 
     observer = DQMetricsObserver(name="test_save_batch_observer")
     dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
@@ -1643,9 +1972,9 @@ def test_apply_checks_and_save_in_table_writes_rule_set_fingerprint(
     """Verify that apply_checks_and_save_in_table / apply_checks_by_metadata_and_save_in_table write non-null rule_set_fingerprint."""
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    input_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
 
     observer = DQMetricsObserver(name="test_observer")
     dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
@@ -1692,6 +2021,76 @@ def test_apply_checks_and_save_in_table_writes_rule_set_fingerprint(
 
 @pytest.mark.parametrize(
     "apply_checks_method",
+    [DQEngine.apply_checks_and_save_in_table, DQEngine.apply_checks_by_metadata_and_save_in_table],
+)
+def test_apply_checks_and_save_in_table_metrics_only(
+    skip_if_classic_compute, apply_checks_method, spark, ws, make_schema, make_random
+):
+    schema_name = make_schema(catalog_name=TEST_CATALOG).name
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+
+    observer = DQMetricsObserver(name="test_observer")
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    test_df = spark.createDataFrame(
+        [
+            [1, "Alice", 30, 50000],
+            [2, "Bob", 25, 45000],
+            [None, "Charlie", 35, 60000],
+            [4, None, 28, 55000],
+        ],
+        TEST_SCHEMA,
+    )
+    test_df.write.saveAsTable(input_table_name)
+
+    input_config = InputConfig(location=input_table_name)
+    metrics_config = OutputConfig(location=metrics_table_name, mode="overwrite")
+
+    if apply_checks_method == DQEngine.apply_checks_and_save_in_table:
+        checks = deserialize_checks(TEST_CHECKS)
+        dq_engine.apply_checks_and_save_in_table(
+            checks=checks,
+            input_config=input_config,
+            metrics_config=metrics_config,
+        )
+    else:
+        dq_engine.apply_checks_by_metadata_and_save_in_table(
+            checks=TEST_CHECKS,
+            input_config=input_config,
+            metrics_config=metrics_config,
+        )
+
+    metrics_rows = spark.table(metrics_table_name).collect()
+    metric_names = {row["metric_name"] for row in metrics_rows}
+    assert metric_names == {
+        "input_row_count",
+        "error_row_count",
+        "warning_row_count",
+        "valid_row_count",
+        "check_metrics",
+    }
+
+    input_locations = {row["input_location"] for row in metrics_rows}
+    assert input_locations == {input_table_name}
+
+    output_locations = {row["output_location"] for row in metrics_rows}
+    assert output_locations == {None}
+
+    quarantine_locations = {row["quarantine_location"] for row in metrics_rows}
+    assert quarantine_locations == {None}
+
+    with pytest.raises(NotFound):
+        ws.tables.get(full_name=output_table_name)
+
+    with pytest.raises(NotFound):
+        ws.tables.get(full_name=quarantine_table_name)
+
+
+@pytest.mark.parametrize(
+    "apply_checks_method",
     [DQEngine.apply_checks_and_split, DQEngine.apply_checks_by_metadata_and_split],
 )
 def test_save_results_in_table_streaming_with_metrics(
@@ -1700,8 +2099,8 @@ def test_save_results_in_table_streaming_with_metrics(
     schema_name = make_schema(catalog_name=TEST_CATALOG).name
     volume_name = make_volume(catalog_name=TEST_CATALOG, schema_name=schema_name).name
 
-    input_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
 
     observer = DQMetricsObserver(name="test_save_batch_observer")
     dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
@@ -1727,12 +2126,12 @@ def test_save_results_in_table_streaming_with_metrics(
         raise ValueError("Invalid 'apply_checks_method' used for testing observable metrics.")
 
     output_config = OutputConfig(
-        location=f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}",
+        location=f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}",
         options={"checkPointLocation": f"/Volumes/{TEST_CATALOG}/{schema_name}/{volume_name}/{make_random(6).lower()}"},
         trigger={"availableNow": True},
     )
     quarantine_config = OutputConfig(
-        location=f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}",
+        location=f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}",
         options={
             "checkPointLocation": f"/Volumes/{TEST_CATALOG}/{schema_name}/{volume_name}/quarantine_{make_random(6).lower()}"
         },
@@ -1849,7 +2248,7 @@ def test_streaming_observer_metrics_output(apply_checks_method, spark, ws, make_
     schema_name = make_schema(catalog_name=TEST_CATALOG).name
     volume_name = make_volume(catalog_name=TEST_CATALOG, schema_name=schema_name).name
 
-    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
     checkpoint_location = f"/Volumes/{TEST_CATALOG}/{schema_name}/{volume_name}/{make_random(6).lower()}"
 
     dq_engine = DQEngine(
@@ -1865,9 +2264,9 @@ def test_streaming_observer_metrics_output(apply_checks_method, spark, ws, make_
         extra_params=EXTRA_PARAMS,
     )
 
-    input_config = InputConfig(location=f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}", is_streaming=True)
+    input_config = InputConfig(location=f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}", is_streaming=True)
     output_config = OutputConfig(
-        location=f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}",
+        location=f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}",
         options={"checkPointLocation": checkpoint_location},
         trigger={"availableNow": True},
     )
@@ -2037,10 +2436,10 @@ def test_streaming_observer_metrics_output_and_quarantine(
     schema_name = make_schema(catalog_name=TEST_CATALOG).name
     volume_name = make_volume(catalog_name=TEST_CATALOG, schema_name=schema_name).name
 
-    input_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
 
     observer = DQMetricsObserver(
         name="test_streaming_observer_with_quarantine",
@@ -2230,9 +2629,9 @@ def test_streaming_observer_metrics_output_with_empty_checks(
     schema_name = make_schema(catalog_name=TEST_CATALOG).name
     volume_name = make_volume(catalog_name=TEST_CATALOG, schema_name=schema_name).name
 
-    input_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
 
     dq_engine = DQEngine(
         workspace_client=ws,
@@ -2392,10 +2791,10 @@ def test_streaming_observer_metrics_output_and_quarantine_with_empty_checks(
     schema_name = make_schema(catalog_name=TEST_CATALOG).name
     volume_name = make_volume(catalog_name=TEST_CATALOG, schema_name=schema_name).name
 
-    input_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
-    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    quarantine_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+    metrics_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
 
     observer = DQMetricsObserver(
         name="test_streaming_observer",
@@ -2683,7 +3082,7 @@ def test_observer_check_metrics_change_between_runs(ws, spark):
 def test_save_results_in_table_with_observer_no_observation(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    quarantine_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    quarantine_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     quarantine_config = OutputConfig(location=quarantine_table, mode="overwrite")
 
     quarantine_df = spark.createDataFrame([[3, 4]], "a: int, b: int")
@@ -2703,3 +3102,168 @@ def _assert_check_metrics(actual_metrics: dict, expected_check_names: list[str])
     check_metrics = json.loads(actual_metrics["check_metrics"])
     actual_names = [m["check_name"] for m in check_metrics]
     assert actual_names == expected_check_names
+
+
+def _standard_test_df(spark):
+    """Standard 4-row test frame: row 3 (id=None) errors, row 4 (name=None) warns under TEST_CHECKS."""
+    return spark.createDataFrame(
+        [
+            [1, "Alice", 30, 50000],
+            [2, "Bob", 25, 45000],
+            [None, "Charlie", 35, 60000],
+            [4, None, 28, 55000],
+        ],
+        TEST_SCHEMA,
+    )
+
+
+def test_compute_summary_metrics(ws, spark):
+    """compute_summary_metrics produces the full metrics set by aggregation, without observe() or an action."""
+    observer = DQMetricsObserver(name=TEST_OBSERVER_NAME)
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    checked_df, _ = dq_engine.apply_checks_by_metadata(_standard_test_df(spark), TEST_CHECKS)
+
+    input_config = InputConfig(location="input_table")
+    output_config = OutputConfig(location="output_table")
+    quarantine_config = OutputConfig(location="quarantine_table")
+    checks_location = "checks_location"
+
+    metrics_df = dq_engine.compute_summary_metrics(
+        checked_df,
+        checks=TEST_CHECKS,
+        input_config=input_config,
+        output_config=output_config,
+        quarantine_config=quarantine_config,
+        checks_location=checks_location,
+    ).orderBy("metric_name")
+
+    def _row(metric_name: str, metric_value: str) -> dict:
+        return {
+            "run_id": EXTRA_PARAMS.run_id_overwrite,
+            "run_name": TEST_OBSERVER_NAME,
+            "input_location": input_config.location,
+            "output_location": output_config.location,
+            "quarantine_location": quarantine_config.location,
+            "checks_location": checks_location,
+            "rule_set_fingerprint": TEST_CHECKS_RULE_SET_FINGERPRINT,
+            "metric_name": metric_name,
+            "metric_value": metric_value,
+            "run_time": RUN_TIME,
+            "error_column_name": "_errors",
+            "warning_column_name": "_warnings",
+            "user_metadata": None,
+        }
+
+    expected_metrics = [
+        _row("check_metrics", TEST_CHECK_METRICS_VALUE),
+        _row("error_row_count", "1"),
+        _row("input_row_count", "4"),
+        _row("valid_row_count", "2"),
+        _row("warning_row_count", "1"),
+    ]
+    expected_metrics_df = spark.createDataFrame(expected_metrics, schema=OBSERVATION_TABLE_SCHEMA).orderBy(
+        "metric_name"
+    )
+
+    assertDataFrameEqual(expected_metrics_df, metrics_df)
+
+
+@pytest.mark.parametrize("apply_checks_method", [DQEngine.apply_checks, DQEngine.apply_checks_by_metadata])
+def test_compute_summary_metrics_matches_observer(ws, spark, apply_checks_method):
+    """Aggregation-based metrics match the observe()-based metrics for the same data and checks (parity)."""
+    observer = DQMetricsObserver(name="test_observer")
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    test_df = _standard_test_df(spark)
+
+    if apply_checks_method == DQEngine.apply_checks:
+        checked_df, observation = dq_engine.apply_checks(test_df, deserialize_checks(TEST_CHECKS))
+    else:
+        checked_df, observation = dq_engine.apply_checks_by_metadata(test_df, TEST_CHECKS)
+
+    checked_df.count()  # trigger the action so the observe()-based metrics populate
+    observed_metrics = observation.get
+
+    # compute_summary_metrics takes metadata checks; TEST_CHECKS yields the same names/breakdown.
+    metrics_df = dq_engine.compute_summary_metrics(checked_df, checks=TEST_CHECKS)
+    computed_metrics = {row["metric_name"]: row["metric_value"] for row in metrics_df.collect()}
+
+    # observe() returns native types (ints); compute_summary_metrics returns the long-format string values.
+    expected_metrics = {name: str(value) for name, value in observed_metrics.items()}
+    assert computed_metrics == expected_metrics
+
+
+def test_compute_summary_metrics_without_checks(ws, spark):
+    """Without checks only the dataset-level metrics are produced; the per-check breakdown is omitted."""
+    observer = DQMetricsObserver(name=TEST_OBSERVER_NAME)
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    checked_df, _ = dq_engine.apply_checks_by_metadata(_standard_test_df(spark), TEST_CHECKS)
+
+    metrics_df = dq_engine.compute_summary_metrics(checked_df)
+    metrics = {row["metric_name"]: row["metric_value"] for row in metrics_df.collect()}
+
+    assert metrics == {
+        "input_row_count": "4",
+        "error_row_count": "1",
+        "warning_row_count": "1",
+        "valid_row_count": "2",
+    }
+
+
+def test_compute_summary_metrics_loads_checks_from_location(ws, spark, make_schema, make_random):
+    """When checks are not passed inline, they are loaded from checks_location so the per-check breakdown
+    and rule_set_fingerprint are still produced (rather than left empty)."""
+    schema_name = make_schema(catalog_name=TEST_CATALOG).name
+    checks_table_name = f"{TEST_CATALOG}.{schema_name}.t{make_random(6).lower()}"
+
+    observer = DQMetricsObserver(name=TEST_OBSERVER_NAME)
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+    dq_engine.save_checks(TEST_CHECKS, config=TableChecksStorageConfig(location=checks_table_name))
+
+    checked_df, _ = dq_engine.apply_checks_by_metadata(_standard_test_df(spark), TEST_CHECKS)
+
+    # Pass only checks_location (no inline checks): the method loads the checks from the table.
+    metrics_df = dq_engine.compute_summary_metrics(checked_df, checks_location=checks_table_name)
+    rows = metrics_df.collect()
+    metric_names = {row["metric_name"] for row in rows}
+
+    # The per-check breakdown is present (proving checks were loaded, not skipped)...
+    assert "check_metrics" in metric_names
+    # ...and the fingerprint matches the one computed from the same checks applied inline.
+    assert {row["rule_set_fingerprint"] for row in rows} == {TEST_CHECKS_RULE_SET_FINGERPRINT}
+    assert {row["checks_location"] for row in rows} == {checks_table_name}
+
+
+def test_compute_summary_metrics_with_dotted_custom_metric_name(ws, spark):
+    """A custom metric aliased with a dotted name must be emitted as-is, not misread as nested-field access."""
+    observer = DQMetricsObserver(name="test_observer", custom_metrics=["count(1) as `a.b`"])
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    checked_df, _ = dq_engine.apply_checks_by_metadata(_standard_test_df(spark), TEST_CHECKS)
+
+    metrics_df = dq_engine.compute_summary_metrics(checked_df, checks=TEST_CHECKS)
+    metrics = {row["metric_name"]: row["metric_value"] for row in metrics_df.collect()}
+
+    # The dotted alias flows through as the metric name with its aggregated value (count over 4 rows).
+    assert metrics["a.b"] == "4"
+
+
+def test_compute_summary_metrics_current_timestamp_and_user_metadata(ws, spark):
+    """Without run_time_overwrite the run_time falls back to current_timestamp(); user_metadata is emitted as a map."""
+    user_metadata = {"team": "data-quality", "env": "test"}
+    observer = DQMetricsObserver(name=TEST_OBSERVER_NAME)
+    # No run_time_overwrite, so build_metrics_df_from_aggregation stamps run_time with current_timestamp().
+    extra_params = ExtraParams(user_metadata=user_metadata)
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=extra_params)
+
+    checked_df, _ = dq_engine.apply_checks_by_metadata(_standard_test_df(spark), TEST_CHECKS)
+
+    rows = dq_engine.compute_summary_metrics(checked_df, checks=TEST_CHECKS).collect()
+
+    assert rows  # metrics were produced
+    # run_time falls back to current_timestamp() (non-null) when no run_time_overwrite is configured.
+    assert all(row["run_time"] is not None for row in rows)
+    # user_metadata is emitted as a map on every metric row.
+    assert all(row["user_metadata"] == user_metadata for row in rows)

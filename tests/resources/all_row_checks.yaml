@@ -476,3 +476,70 @@
       column: col5
       max_age_minutes: 18000
       base_timestamp: col6
+
+# is_valid_email check
+- criticality: error
+  check:
+    function: is_valid_email
+    arguments:
+      column: col_email
+
+# is_valid_url check
+- criticality: error
+  check:
+    function: is_valid_url
+    arguments:
+      column: col_url
+
+# is_valid_uuid check
+- criticality: error
+  check:
+    function: is_valid_uuid
+    arguments:
+      column: col_uuid
+
+# has_valid_string_case check
+- criticality: error
+  check:
+    function: has_valid_string_case
+    arguments:
+      column: col1
+      case: lower
+# is_valid_national_id check
+- criticality: error
+  check:
+    function: is_valid_national_id
+    arguments:
+      column: col_ssn
+      country: US
+
+# is_valid_country_code check
+- criticality: error
+  check:
+    function: is_valid_country_code
+    arguments:
+      column: col_country
+      code_format: alpha-2
+
+# is_valid_currency_code check
+- criticality: error
+  check:
+    function: is_valid_currency_code
+    arguments:
+      column: col_currency
+      code_format: alphabetic
+
+# is_valid_subdivision_code check
+- criticality: error
+  check:
+    function: is_valid_subdivision_code
+    arguments:
+      column: col_subdivision
+
+# is_valid_language_code check
+- criticality: error
+  check:
+    function: is_valid_language_code
+    arguments:
+      column: col_language
+      code_format: alpha-2

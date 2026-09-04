@@ -15,21 +15,9 @@ from databricks.labs.blueprint.logger import install_logger
 
 from databricks.sdk.retries import retried
 
-from databricks.labs.dqx.__about__ import __version__
+from databricks.labs.dqx.__version__ import __version__
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class LogRecord:
-    timestamp: int
-    job_id: int
-    job_name: str
-    task_name: str
-    job_run_id: int
-    level: str
-    component: str
-    message: str
 
 
 @dataclass

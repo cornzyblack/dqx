@@ -6,7 +6,13 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import type { UseMutationOptions, UseMutationResult, UseQueryOptions, UseQueryResult } from "@tanstack/react-query";
 import * as axios from "axios";
 import type { AxiosError, AxiosRequestConfig, AxiosResponse } from "axios";
-import type { RuleCatalogEntryOut, RunStatusOut } from "./api";
+import type {
+  BatchImportRegistryRulesIn,
+  BatchImportRegistryRulesOut,
+  CreateRegistryRuleOut,
+  RuleCatalogEntryOut,
+  RunStatusOut,
+} from "./api";
 
 export interface BatchSaveRulesIn {
   table_fqns: string[];
@@ -66,6 +72,11 @@ export interface DryRunSubmitOutCustom {
   run_id: string;
   job_run_id: number;
   view_fqn: string;
+  /** Source table FQN this run was submitted for — added so callers can
+   *  associate each submitted run with its table by value instead of by
+   *  request-array position (batch submission skips tables that fail
+   *  validation, which shifts index-based lookups out of alignment). */
+  table_fqn?: string | null;
 }
 
 export interface BatchRunFromCatalogOut {
@@ -178,31 +189,46 @@ export interface ValidationRunSummaryOut {
   warning_rows: number | null;
   created_at: string | null;
   error_message: string | null;
+  /** Real wall-clock run duration in seconds, computed server-side from the
+   *  RUNNING-placeholder → terminal-row span so it matches the linked
+   *  Databricks job. Null while RUNNING or when the true start is unrecoverable
+   *  (old runs). Mirrors ProfileRunSummaryOut.duration_seconds. */
+  duration_seconds?: number | null;
+  /** Databricks task-runner job run id — combined with the workspace host +
+   *  task-runner job id (from getWorkspaceHost) to build a deep link to the
+   *  run page. Null for runs predating job-run tracking. */
+  job_run_id?: number | null;
   checks: Record<string, unknown>[];
+  review_status?: string | null;
+  review_status_is_default?: boolean;
+  review_status_updated_by?: string | null;
+  review_status_updated_at?: string | null;
 }
 
 export const listValidationRuns = (
+  params?: { summary?: boolean; review_status?: string[] },
   options?: AxiosRequestConfig,
 ): Promise<AxiosResponse<ValidationRunSummaryOut[]>> => {
-  return axios.default.get(`/api/v1/dryrun/runs`, options);
+  return axios.default.get(`/api/v1/dryrun/runs`, { ...options, params });
 };
 
-export const getListValidationRunsQueryKey = () =>
-  [`/api/v1/dryrun/runs`] as const;
+export const getListValidationRunsQueryKey = (params?: { summary?: boolean; review_status?: string[] }) =>
+  [`/api/v1/dryrun/runs`, params ?? null] as const;
 
 export const useListValidationRuns = <
   TData = Awaited<ReturnType<typeof listValidationRuns>>,
   TError = AxiosError<unknown>,
 >(
+  params?: { summary?: boolean; review_status?: string[] },
   options?: {
     query?: Partial<UseQueryOptions<Awaited<ReturnType<typeof listValidationRuns>>, TError, TData>>;
     axios?: AxiosRequestConfig;
   },
 ): UseQueryResult<TData, TError> => {
   const { query: queryOptions, axios: axiosOptions } = options ?? {};
-  const queryKey = queryOptions?.queryKey ?? getListValidationRunsQueryKey();
+  const queryKey = queryOptions?.queryKey ?? getListValidationRunsQueryKey(params);
 
-  const queryFn = () => listValidationRuns(axiosOptions);
+  const queryFn = () => listValidationRuns(params, axiosOptions);
 
   return useQuery({ queryKey, queryFn, ...queryOptions }) as UseQueryResult<TData, TError>;
 };
@@ -218,7 +244,7 @@ export const cancelDryRun = (
 ): Promise<AxiosResponse<{ status: string; run_id: string }>> => {
   return axios.default.post(`/api/v1/dryrun/runs/${runId}/cancel`, null, {
     ...options,
-    params,
+    params: { ...params, ...options?.params },
   });
 };
 
@@ -233,7 +259,7 @@ export const getDryRunStatusCustom = (
 ): Promise<AxiosResponse<RunStatusOut>> => {
   return axios.default.get(`/api/v1/dryrun/runs/${runId}/status`, {
     ...options,
-    params,
+    params: { ...params, ...options?.params },
   });
 };
 
@@ -248,7 +274,7 @@ export const cancelProfileRun = (
 ): Promise<AxiosResponse<{ status: string; run_id: string }>> => {
   return axios.default.post(`/api/v1/profiler/runs/${runId}/cancel`, null, {
     ...options,
-    params,
+    params: { ...params, ...options?.params },
   });
 };
 
@@ -492,7 +518,7 @@ export const listComments = (
 ): Promise<AxiosResponse<CommentOut[]>> => {
   return axios.default.get(`/api/v1/comments`, {
     ...options,
-    params: { entity_type: entityType, entity_id: entityId },
+    params: { entity_type: entityType, entity_id: entityId, ...options?.params },
   });
 };
 
@@ -580,9 +606,16 @@ export interface QuarantineListOut {
   limit: number;
 }
 
+export interface QuarantineQueryParams {
+  offset?: number;
+  limit?: number;
+  /** Filter to rows that failed only this check (matches errors or warnings). */
+  check_name?: string;
+}
+
 export const listQuarantineRecords = (
   runId: string,
-  params?: { offset?: number; limit?: number },
+  params?: QuarantineQueryParams,
   options?: AxiosRequestConfig,
 ): Promise<AxiosResponse<QuarantineListOut>> => {
   return axios.default.get(`/api/v1/quarantine/runs/${runId}`, {
@@ -591,15 +624,19 @@ export const listQuarantineRecords = (
   });
 };
 
-export const getQuarantineRecordsQueryKey = (runId: string, offset?: number, limit?: number) =>
-  [`/api/v1/quarantine/runs`, runId, offset, limit] as const;
+export const getQuarantineRecordsQueryKey = (
+  runId: string,
+  offset?: number,
+  limit?: number,
+  checkName?: string,
+) => [`/api/v1/quarantine/runs`, runId, offset, limit, checkName ?? null] as const;
 
 export const useListQuarantineRecords = <
   TData = Awaited<ReturnType<typeof listQuarantineRecords>>,
   TError = AxiosError<unknown>,
 >(
   runId: string,
-  params?: { offset?: number; limit?: number },
+  params?: QuarantineQueryParams,
   options?: {
     query?: Partial<UseQueryOptions<Awaited<ReturnType<typeof listQuarantineRecords>>, TError, TData>>;
     axios?: AxiosRequestConfig;
@@ -607,7 +644,13 @@ export const useListQuarantineRecords = <
 ): UseQueryResult<TData, TError> => {
   const { query: queryOptions, axios: axiosOptions } = options ?? {};
   const queryKey =
-    queryOptions?.queryKey ?? getQuarantineRecordsQueryKey(runId, params?.offset, params?.limit);
+    queryOptions?.queryKey ??
+    getQuarantineRecordsQueryKey(
+      runId,
+      params?.offset,
+      params?.limit,
+      params?.check_name,
+    );
 
   const queryFn = () => listQuarantineRecords(runId, params, axiosOptions);
 
@@ -621,27 +664,33 @@ export const useListQuarantineRecords = <
 
 export const getQuarantineCount = (
   runId: string,
+  params?: { check_name?: string },
   options?: AxiosRequestConfig,
 ): Promise<AxiosResponse<{ count: number }>> => {
-  return axios.default.get(`/api/v1/quarantine/runs/${runId}/count`, options);
+  return axios.default.get(`/api/v1/quarantine/runs/${runId}/count`, {
+    ...options,
+    params,
+  });
 };
 
-export const getQuarantineCountQueryKey = (runId: string) =>
-  [`/api/v1/quarantine/runs/count`, runId] as const;
+export const getQuarantineCountQueryKey = (runId: string, checkName?: string) =>
+  [`/api/v1/quarantine/runs/count`, runId, checkName ?? null] as const;
 
 export const useQuarantineCount = <
   TData = Awaited<ReturnType<typeof getQuarantineCount>>,
   TError = AxiosError<unknown>,
 >(
   runId: string,
+  params?: { check_name?: string },
   options?: {
     query?: Partial<UseQueryOptions<Awaited<ReturnType<typeof getQuarantineCount>>, TError, TData>>;
     axios?: AxiosRequestConfig;
   },
 ): UseQueryResult<TData, TError> => {
   const { query: queryOptions, axios: axiosOptions } = options ?? {};
-  const queryKey = queryOptions?.queryKey ?? getQuarantineCountQueryKey(runId);
-  const queryFn = () => getQuarantineCount(runId, axiosOptions);
+  const queryKey =
+    queryOptions?.queryKey ?? getQuarantineCountQueryKey(runId, params?.check_name);
+  const queryFn = () => getQuarantineCount(runId, params, axiosOptions);
   return useQuery({
     queryKey,
     queryFn,
@@ -653,9 +702,11 @@ export const useQuarantineCount = <
 export const exportQuarantineRecords = (
   runId: string,
   format: "csv" | "json" | "xlsx" = "csv",
+  checkName?: string,
 ): void => {
-  const url = `/api/v1/quarantine/runs/${runId}/export?format=${format}`;
-  window.open(url, "_blank");
+  const params = new URLSearchParams({ format });
+  if (checkName) params.set("check_name", checkName);
+  window.open(`/api/v1/quarantine/runs/${runId}/export?${params.toString()}`, "_blank");
 };
 
 // ---------------------------------------------------------------------------
@@ -780,7 +831,13 @@ export const useTimezone = <
     queryKey: queryOptions?.queryKey ?? getTimezoneQueryKey(),
     queryFn: () => getTimezone(axiosOptions),
     select: ((resp: Awaited<ReturnType<typeof getTimezone>>) => resp.data) as never,
-    staleTime: 5 * 60 * 1000,
+    // Session-stable app config: the workspace timezone doesn't change within a
+    // session, so pin to Infinity (matching role/version/approvals-mode) rather
+    // than the 5-minute default — otherwise every component that mounts this
+    // after the window lapses re-fetches config/timezone. The settings page
+    // invalidates getTimezoneQueryKey() on save, so an actual change still
+    // refreshes it.
+    staleTime: Infinity,
     ...queryOptions,
   }) as UseQueryResult<TData, TError>;
 };
@@ -827,6 +884,26 @@ export interface LabelDefinition {
   description?: string | null;
   values: string[];
   allow_custom_values: boolean;
+  /** Optional value → "#RRGGBB" color map for badge rendering. */
+  value_colors?: Record<string, string> | null;
+  /** Optional value → short description map (e.g. per-dimension explanations). */
+  value_descriptions?: Record<string, string> | null;
+  /**
+   * Optional value → DQX criticality ("warn" | "error") map. Only meaningful
+   * on the reserved ``severity`` key: the materializer reads it to decide
+   * which criticality a registry rule's effective severity renders as (see
+   * `registry_models.resolve_criticality`); unmapped values fall back to the
+   * built-in defaults. Pruned to keys present in ``values`` on save.
+   */
+  value_criticality?: Record<string, string> | null;
+  /**
+   * True for reserved, pre-seeded keys (e.g. the Rules Registry
+   * ``dimension``/``severity`` tags). Such keys cannot be deleted or
+   * renamed via `saveLabelDefinitions`, though their values, colors, and
+   * description may still be freely edited. Authoritative from the
+   * server — a client cannot grant/strip this flag via the save payload.
+   */
+  is_builtin?: boolean;
 }
 
 export interface LabelDefinitionsOut {
@@ -974,3 +1051,764 @@ export const useSaveRetentionSettings = <
     ...mutationOptions,
   });
 };
+
+// ---------------------------------------------------------------------------
+// Workspace host — used to build deep links into the Databricks workspace UI
+// (e.g. Unity Catalog explorer pages). Accessible to all authenticated users;
+// the linked pages enforce the caller's own permissions on arrival.
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceHostOut {
+  workspace_host: string;
+  /** Task-runner Databricks job id. Combined with the host and a run's
+   *  job_run_id the UI builds a link to the run page:
+   *  ``{workspace_host}/jobs/{job_id}/runs/{job_run_id}``. Empty when unset. */
+  job_id?: string;
+}
+
+export const getWorkspaceHost = (
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<WorkspaceHostOut>> =>
+  axios.default.get("/api/v1/config/workspace-host", options);
+
+export const getWorkspaceHostQueryKey = () => ["workspace-host"] as const;
+
+export const useWorkspaceHost = <
+  TData = Awaited<ReturnType<typeof getWorkspaceHost>>["data"],
+  TError = AxiosError<unknown>,
+>(
+  options?: {
+    query?: Partial<UseQueryOptions<Awaited<ReturnType<typeof getWorkspaceHost>>, TError, TData>>;
+    axios?: AxiosRequestConfig;
+  },
+): UseQueryResult<TData, TError> => {
+  const { query: queryOptions, axios: axiosOptions } = options ?? {};
+  return useQuery({
+    queryKey: queryOptions?.queryKey ?? getWorkspaceHostQueryKey(),
+    queryFn: () => getWorkspaceHost(axiosOptions),
+    select: ((resp: Awaited<ReturnType<typeof getWorkspaceHost>>) => resp.data) as never,
+    // The host is fixed for the lifetime of the app container — cache hard.
+    staleTime: Infinity,
+    ...queryOptions,
+  }) as UseQueryResult<TData, TError>;
+};
+
+// ---------------------------------------------------------------------------
+// Run review statuses — admin-managed catalogue of values surfaced as the
+// per-run review dropdown on the Runs detail page and as a multi-select
+// filter on the Runs History page. Exactly one entry is flagged
+// ``is_default`` (backend invariant); that value is what the listing
+// endpoint returns virtually for unreviewed runs.
+//
+// The ``color`` field carries a design-system token name (gray, amber,
+// green, blue, red, purple, ...) that the UI maps to a tailwind palette
+// so we can rebrand without touching backend data.
+// ---------------------------------------------------------------------------
+
+export interface RunReviewStatusOption {
+  value: string;
+  description: string;
+  color: string;
+  is_default: boolean;
+}
+
+export interface RunReviewStatusesOut {
+  statuses: RunReviewStatusOption[];
+}
+
+export interface RunReviewStatusesIn {
+  statuses: RunReviewStatusOption[];
+}
+
+export const getRunReviewStatuses = (
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<RunReviewStatusesOut>> =>
+  axios.default.get("/api/v1/config/run-review-statuses", options);
+
+export const getRunReviewStatusesQueryKey = () => ["run-review-statuses"] as const;
+
+export const useRunReviewStatuses = <
+  TData = Awaited<ReturnType<typeof getRunReviewStatuses>>["data"],
+  TError = AxiosError<unknown>,
+>(
+  options?: {
+    query?: Partial<UseQueryOptions<Awaited<ReturnType<typeof getRunReviewStatuses>>, TError, TData>>;
+    axios?: AxiosRequestConfig;
+  },
+): UseQueryResult<TData, TError> => {
+  const { query: queryOptions, axios: axiosOptions } = options ?? {};
+  return useQuery({
+    queryKey: queryOptions?.queryKey ?? getRunReviewStatusesQueryKey(),
+    queryFn: () => getRunReviewStatuses(axiosOptions),
+    select: ((resp: Awaited<ReturnType<typeof getRunReviewStatuses>>) => resp.data) as never,
+    // The dropdown is rendered in three places (Config card, Runs
+    // detail, Runs History filter) — a 5-min stale window keeps the
+    // navigation fast while letting admin saves propagate naturally
+    // through React Query's invalidation on the mutation hook below.
+    staleTime: 5 * 60 * 1000,
+    ...queryOptions,
+  }) as UseQueryResult<TData, TError>;
+};
+
+export const saveRunReviewStatuses = (
+  body: RunReviewStatusesIn,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<RunReviewStatusesOut>> =>
+  axios.default.put("/api/v1/config/run-review-statuses", body, options);
+
+export const useSaveRunReviewStatuses = <
+  TError = AxiosError<unknown>,
+  TContext = unknown,
+>(
+  options?: {
+    mutation?: UseMutationOptions<
+      Awaited<ReturnType<typeof saveRunReviewStatuses>>,
+      TError,
+      { data: RunReviewStatusesIn },
+      TContext
+    >;
+    axios?: AxiosRequestConfig;
+  },
+): UseMutationResult<
+  Awaited<ReturnType<typeof saveRunReviewStatuses>>,
+  TError,
+  { data: RunReviewStatusesIn },
+  TContext
+> => {
+  const { mutation: mutationOptions, axios: axiosOptions } = options ?? {};
+  return useMutation({
+    mutationFn: ({ data }: { data: RunReviewStatusesIn }) => saveRunReviewStatuses(data, axiosOptions),
+    ...mutationOptions,
+  });
+};
+
+// ---------------------------------------------------------------------------
+// Per-run review status — set/clear/get/history endpoints for the dropdown
+// + audit list on the Runs detail page. ``is_default`` distinguishes the
+// virtual catalogue default (no row in dq_run_review_status) from an
+// explicit value — the UI uses it to render "(auto)" hints and skip
+// meaningless updated_by/updated_at metadata.
+// ---------------------------------------------------------------------------
+
+export interface RunReviewStatusOut {
+  run_id: string;
+  status: string;
+  updated_by: string | null;
+  updated_at: string | null;
+  is_default: boolean;
+}
+
+export interface SetRunReviewStatusIn {
+  status: string;
+}
+
+export interface RunReviewStatusHistoryEntry {
+  run_id: string;
+  status: string;
+  previous_status: string | null;
+  changed_by: string;
+  changed_at: string | null;
+}
+
+export interface RunReviewStatusHistoryOut {
+  history: RunReviewStatusHistoryEntry[];
+}
+
+export const getRunReviewStatus = (
+  runId: string,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<RunReviewStatusOut>> =>
+  axios.default.get(`/api/v1/runs/${encodeURIComponent(runId)}/review-status`, options);
+
+export const getRunReviewStatusQueryKey = (runId: string) =>
+  ["run-review-status", runId] as const;
+
+export const useRunReviewStatus = <
+  TData = Awaited<ReturnType<typeof getRunReviewStatus>>["data"],
+  TError = AxiosError<unknown>,
+>(
+  runId: string,
+  options?: {
+    query?: Partial<UseQueryOptions<Awaited<ReturnType<typeof getRunReviewStatus>>, TError, TData>>;
+    axios?: AxiosRequestConfig;
+  },
+): UseQueryResult<TData, TError> => {
+  const { query: queryOptions, axios: axiosOptions } = options ?? {};
+  return useQuery({
+    queryKey: queryOptions?.queryKey ?? getRunReviewStatusQueryKey(runId),
+    queryFn: () => getRunReviewStatus(runId, axiosOptions),
+    select: ((resp: Awaited<ReturnType<typeof getRunReviewStatus>>) => resp.data) as never,
+    enabled: Boolean(runId),
+    ...queryOptions,
+  }) as UseQueryResult<TData, TError>;
+};
+
+export const setRunReviewStatus = (
+  runId: string,
+  body: SetRunReviewStatusIn,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<RunReviewStatusOut>> =>
+  axios.default.put(`/api/v1/runs/${encodeURIComponent(runId)}/review-status`, body, options);
+
+export const useSetRunReviewStatus = <
+  TError = AxiosError<unknown>,
+  TContext = unknown,
+>(
+  options?: {
+    mutation?: UseMutationOptions<
+      Awaited<ReturnType<typeof setRunReviewStatus>>,
+      TError,
+      { runId: string; data: SetRunReviewStatusIn },
+      TContext
+    >;
+    axios?: AxiosRequestConfig;
+  },
+): UseMutationResult<
+  Awaited<ReturnType<typeof setRunReviewStatus>>,
+  TError,
+  { runId: string; data: SetRunReviewStatusIn },
+  TContext
+> => {
+  const { mutation: mutationOptions, axios: axiosOptions } = options ?? {};
+  return useMutation({
+    mutationFn: ({ runId, data }: { runId: string; data: SetRunReviewStatusIn }) =>
+      setRunReviewStatus(runId, data, axiosOptions),
+    ...mutationOptions,
+  });
+};
+
+export const clearRunReviewStatus = (
+  runId: string,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<RunReviewStatusOut>> =>
+  axios.default.delete(`/api/v1/runs/${encodeURIComponent(runId)}/review-status`, options);
+
+export const useClearRunReviewStatus = <
+  TError = AxiosError<unknown>,
+  TContext = unknown,
+>(
+  options?: {
+    mutation?: UseMutationOptions<
+      Awaited<ReturnType<typeof clearRunReviewStatus>>,
+      TError,
+      { runId: string },
+      TContext
+    >;
+    axios?: AxiosRequestConfig;
+  },
+): UseMutationResult<
+  Awaited<ReturnType<typeof clearRunReviewStatus>>,
+  TError,
+  { runId: string },
+  TContext
+> => {
+  const { mutation: mutationOptions, axios: axiosOptions } = options ?? {};
+  return useMutation({
+    mutationFn: ({ runId }: { runId: string }) => clearRunReviewStatus(runId, axiosOptions),
+    ...mutationOptions,
+  });
+};
+
+// ---------------------------------------------------------------------------
+// Batch-record pending applications (Bulk Contract Import — Phase 2)
+//
+// Stages applications for registry rules that landed ``pending_approval``
+// (approval-enabled orgs): each (binding_id, rule_id, column_mapping) is
+// recorded in ``dq_pending_applications`` and activated by the backend when
+// the rule is later approved. Hand-written here until the OpenAPI spec is
+// regenerated (``make app-regen-api``). Mirrors the backend
+// ``batchRecordPendingApplications`` operation.
+// ---------------------------------------------------------------------------
+
+export interface RecordPendingApplicationIn {
+  binding_id: string;
+  rule_id: string;
+  /** One slot-name -> column-name group per materialized check; empty for
+   *  whole-table rules (no slots). */
+  column_mapping: Array<Record<string, string>>;
+}
+
+export interface BatchRecordPendingApplicationsIn {
+  applications: RecordPendingApplicationIn[];
+}
+
+export interface BatchRecordPendingApplicationsFailure {
+  index: number;
+  error: string;
+}
+
+export interface BatchRecordPendingApplicationsOut {
+  recorded: number;
+  failed: BatchRecordPendingApplicationsFailure[];
+}
+
+export const batchRecordPendingApplications = (
+  body: BatchRecordPendingApplicationsIn,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<BatchRecordPendingApplicationsOut>> => {
+  return axios.default.post(`/api/v1/monitored-tables/pending-applications/batch`, body, options);
+};
+
+// ---------------------------------------------------------------------------
+// List pending applications for a binding (Bulk Contract Import — Phase 2)
+//
+// Read side of the staging store: the applications recorded above that are
+// still waiting on their rule's approval. Surfaced read-only on the Apply
+// Rules tab so a staged (but not-yet-applied) rule is visible instead of the
+// table looking empty. Enriched server-side with the referenced rule's
+// name/status. Mirrors the backend ``listPendingApplications`` operation.
+// ---------------------------------------------------------------------------
+
+export interface PendingApplicationOut {
+  id: string;
+  binding_id: string;
+  rule_id: string;
+  rule_name: string | null;
+  rule_status: string | null;
+  column_mapping: Array<Record<string, string>>;
+  created_by: string | null;
+  created_at: string | null;
+}
+
+export const listPendingApplications = (
+  bindingId: string,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<PendingApplicationOut[]>> => {
+  return axios.default.get(
+    `/api/v1/monitored-tables/${encodeURIComponent(bindingId)}/pending-applications`,
+    options,
+  );
+};
+
+export const getListPendingApplicationsQueryKey = (bindingId: string) =>
+  ["pending-applications", bindingId] as const;
+
+// ---------------------------------------------------------------------------
+// Batch-import registry rules with structural dedup (Bulk Contract Import)
+//
+// Extends the generated `batchImportRegistryRules` with `skip_duplicates`:
+// when true the backend reuses an existing structurally-identical ACTIVE rule
+// (draft/pending_approval/approved) instead of minting a duplicate, and dedupes
+// repeated rules within the batch — returning the matches in `reused`. Kept
+// here (rather than editing the auto-generated api.ts) until the OpenAPI spec
+// is regenerated. Posts to the same endpoint as the generated client.
+// ---------------------------------------------------------------------------
+
+export interface BatchImportRegistryRulesDedupIn extends BatchImportRegistryRulesIn {
+  /** Reuse an existing active rule by fingerprint instead of creating a copy. */
+  skip_duplicates?: boolean;
+}
+
+export interface BatchImportRegistryRulesDedupOut extends BatchImportRegistryRulesOut {
+  /** Rules matched to an existing active rule by fingerprint — not created. */
+  reused?: CreateRegistryRuleOut[];
+}
+
+export const batchImportRegistryRulesWithDedup = (
+  body: BatchImportRegistryRulesDedupIn,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<BatchImportRegistryRulesDedupOut>> => {
+  return axios.default.post(`/api/v1/registry-rules/batch-import`, body, options);
+};
+
+export const useListPendingApplications = <
+  TData = Awaited<ReturnType<typeof listPendingApplications>>,
+  TError = AxiosError<unknown>,
+>(
+  bindingId: string,
+  options?: {
+    query?: Partial<UseQueryOptions<Awaited<ReturnType<typeof listPendingApplications>>, TError, TData>>;
+    axios?: AxiosRequestConfig;
+  },
+): UseQueryResult<TData, TError> => {
+  const { query: queryOptions, axios: axiosOptions } = options ?? {};
+  const queryKey = queryOptions?.queryKey ?? getListPendingApplicationsQueryKey(bindingId);
+  const queryFn = () => listPendingApplications(bindingId, axiosOptions);
+  return useQuery({
+    queryKey,
+    queryFn,
+    enabled: !!bindingId,
+    ...queryOptions,
+  }) as UseQueryResult<TData, TError>;
+};
+
+export const getRunReviewStatusHistory = (
+  runId: string,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<RunReviewStatusHistoryOut>> =>
+  axios.default.get(`/api/v1/runs/${encodeURIComponent(runId)}/review-status/history`, options);
+
+export const getRunReviewStatusHistoryQueryKey = (runId: string) =>
+  ["run-review-status-history", runId] as const;
+
+export const useRunReviewStatusHistory = <
+  TData = Awaited<ReturnType<typeof getRunReviewStatusHistory>>["data"],
+  TError = AxiosError<unknown>,
+>(
+  runId: string,
+  options?: {
+    query?: Partial<UseQueryOptions<Awaited<ReturnType<typeof getRunReviewStatusHistory>>, TError, TData>>;
+    axios?: AxiosRequestConfig;
+  },
+): UseQueryResult<TData, TError> => {
+  const { query: queryOptions, axios: axiosOptions } = options ?? {};
+  return useQuery({
+    queryKey: queryOptions?.queryKey ?? getRunReviewStatusHistoryQueryKey(runId),
+    queryFn: () => getRunReviewStatusHistory(runId, axiosOptions),
+    select: ((resp: Awaited<ReturnType<typeof getRunReviewStatusHistory>>) => resp.data) as never,
+    enabled: Boolean(runId),
+    ...queryOptions,
+  }) as UseQueryResult<TData, TError>;
+};
+
+// ---------------------------------------------------------------------------
+// Export to YAML — registry rules / monitored tables / table spaces.
+// Backend renders the YAML (DQX check-list or ODCS DataContract) and returns
+// an ExportOut envelope; the client downloads `content` as `filename`. These
+// are on-demand actions (fetch-on-click, no react-query cache), so they are
+// plain axios calls rather than hooks. Moves to the generated client once the
+// OpenAPI spec is regenerated.
+// ---------------------------------------------------------------------------
+
+/** The two export formats. `dqx` = DQX check-list YAML (re-importable);
+ *  `odcs` = ODCS v3 DataContract. The rule registry supports `dqx` only. */
+export type ExportFormat = "dqx" | "odcs";
+
+export interface ExportOut {
+  /** Suggested download filename, e.g. "registry_rules.dqx.yaml". */
+  filename: string;
+  /** The rendered YAML document. */
+  content: string;
+  /** The format that was produced: "dqx" or "odcs". */
+  format: string;
+}
+
+export interface RegistryRuleExportParams {
+  status?: string | null;
+  dimension?: string | null;
+  severity?: string | null;
+  owner?: string | null;
+  tag?: string | null;
+  /** Restrict export to this explicit set of rule ids (serialized as repeated
+   * `rule_id` query params) — used by the overview's selection action bar. */
+  rule_id?: string[];
+}
+
+export interface MonitoredTableExportParams {
+  format?: ExportFormat;
+  status?: string | null;
+  owner?: string | null;
+  catalog?: string | null;
+  schema?: string | null;
+  name?: string | null;
+  /** Restrict export to this explicit set of binding ids (serialized as repeated
+   * `binding_id` query params) — used by the overview's selection action bar. */
+  binding_id?: string[];
+}
+
+export interface DataProductExportParams {
+  format?: ExportFormat;
+  /** Restrict export to this explicit set of product ids (serialized as repeated
+   * `product_id` query params) — used by the overview's selection action bar. */
+  product_id?: string[];
+}
+
+export const exportRegistryRules = (
+  params?: RegistryRuleExportParams,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<ExportOut>> =>
+  axios.default.get(`/api/v1/export/registry-rules`, { ...options, params });
+
+export const exportRegistryRule = (
+  ruleId: string,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<ExportOut>> =>
+  axios.default.get(`/api/v1/export/registry-rules/${encodeURIComponent(ruleId)}`, options);
+
+export const exportMonitoredTables = (
+  params?: MonitoredTableExportParams,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<ExportOut>> =>
+  axios.default.get(`/api/v1/export/monitored-tables`, { ...options, params });
+
+export const exportMonitoredTable = (
+  bindingId: string,
+  format: ExportFormat,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<ExportOut>> =>
+  // Cast: axios ≥1.19 types `AxiosRequestConfig<D, P>` and rejects spreading
+  // an untyped `options` with a narrower `params` object (paramsSerializer
+  // variance). The cast keeps this compatible with both 1.18 and 1.19.
+  axios.default.get(`/api/v1/export/monitored-tables/${encodeURIComponent(bindingId)}`, {
+    ...options,
+    params: { format },
+  } as AxiosRequestConfig);
+
+export const exportDataProducts = (
+  params?: DataProductExportParams,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<ExportOut>> =>
+  axios.default.get(`/api/v1/export/data-products`, { ...options, params });
+
+export const exportDataProduct = (
+  productId: string,
+  format: ExportFormat,
+  options?: AxiosRequestConfig,
+): Promise<AxiosResponse<ExportOut>> =>
+  axios.default.get(`/api/v1/export/data-products/${encodeURIComponent(productId)}`, {
+    ...options,
+    params: { format },
+  } as AxiosRequestConfig);
+
+/** Trigger a browser download of an ExportOut's YAML content. */
+export const downloadExportFile = (out: ExportOut): void => {
+  const blob = new Blob([out.content], { type: "application/x-yaml;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = out.filename;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+// ---------------------------------------------------------------------------
+// Lifecycle change rationale (until OpenAPI / orval regenerate)
+// ---------------------------------------------------------------------------
+
+export interface LifecycleRationaleIn {
+  rationale?: string | null;
+}
+
+type LifecycleVars = { rationale?: string | null };
+
+export const submitRegistryRuleWithRationale = (
+  ruleId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) => axios.default.post(`/api/v1/registry-rules/${encodeURIComponent(ruleId)}/submit`, data ?? {}, options);
+
+export const approveRegistryRuleWithRationale = (
+  ruleId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) => axios.default.post(`/api/v1/registry-rules/${encodeURIComponent(ruleId)}/approve`, data ?? {}, options);
+
+export const rejectRegistryRuleWithRationale = (
+  ruleId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) => axios.default.post(`/api/v1/registry-rules/${encodeURIComponent(ruleId)}/reject`, data ?? {}, options);
+
+export const submitMonitoredTableWithRationale = (
+  bindingId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) =>
+  axios.default.post(
+    `/api/v1/monitored-tables/${encodeURIComponent(bindingId)}/submit`,
+    data ?? {},
+    options,
+  );
+
+export const approveMonitoredTableWithRationale = (
+  bindingId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) =>
+  axios.default.post(
+    `/api/v1/monitored-tables/${encodeURIComponent(bindingId)}/approve`,
+    data ?? {},
+    options,
+  );
+
+export const rejectMonitoredTableWithRationale = (
+  bindingId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) =>
+  axios.default.post(
+    `/api/v1/monitored-tables/${encodeURIComponent(bindingId)}/reject`,
+    data ?? {},
+    options,
+  );
+
+export const submitDataProductWithRationale = (
+  productId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) =>
+  axios.default.post(`/api/v1/data-products/${encodeURIComponent(productId)}/submit`, data ?? {}, options);
+
+export const approveDataProductWithRationale = (
+  productId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) =>
+  axios.default.post(`/api/v1/data-products/${encodeURIComponent(productId)}/approve`, data ?? {}, options);
+
+export const rejectDataProductWithRationale = (
+  productId: string,
+  data?: LifecycleRationaleIn | null,
+  options?: AxiosRequestConfig,
+) =>
+  axios.default.post(`/api/v1/data-products/${encodeURIComponent(productId)}/reject`, data ?? {}, options);
+
+function useLifecyclePost<TVars extends Record<string, unknown>>(
+  key: string,
+  fn: (vars: TVars & LifecycleVars, axiosOptions?: AxiosRequestConfig) => Promise<AxiosResponse<unknown>>,
+  options?: {
+    mutation?: UseMutationOptions<AxiosResponse<unknown>, AxiosError<unknown>, TVars & LifecycleVars, unknown>;
+    axios?: AxiosRequestConfig;
+  },
+) {
+  const { mutation: mutationOptions, axios: axiosOptions } = options ?? {};
+  return useMutation({
+    mutationKey: [key],
+    mutationFn: (vars: TVars & LifecycleVars) => fn(vars, axiosOptions),
+    ...mutationOptions,
+  });
+}
+
+export const useSubmitRegistryRuleWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { ruleId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "submitRegistryRuleWithRationale",
+    (vars, axiosOptions) =>
+      submitRegistryRuleWithRationale(vars.ruleId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );
+
+export const useApproveRegistryRuleWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { ruleId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "approveRegistryRuleWithRationale",
+    (vars, axiosOptions) =>
+      approveRegistryRuleWithRationale(vars.ruleId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );
+
+export const useRejectRegistryRuleWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { ruleId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "rejectRegistryRuleWithRationale",
+    (vars, axiosOptions) =>
+      rejectRegistryRuleWithRationale(vars.ruleId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );
+
+export const useSubmitMonitoredTableWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { bindingId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "submitMonitoredTableWithRationale",
+    (vars, axiosOptions) =>
+      submitMonitoredTableWithRationale(vars.bindingId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );
+
+export const useApproveMonitoredTableWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { bindingId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "approveMonitoredTableWithRationale",
+    (vars, axiosOptions) =>
+      approveMonitoredTableWithRationale(vars.bindingId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );
+
+export const useRejectMonitoredTableWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { bindingId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "rejectMonitoredTableWithRationale",
+    (vars, axiosOptions) =>
+      rejectMonitoredTableWithRationale(vars.bindingId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );
+
+export const useSubmitDataProductWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { productId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "submitDataProductWithRationale",
+    (vars, axiosOptions) =>
+      submitDataProductWithRationale(vars.productId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );
+
+export const useApproveDataProductWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { productId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "approveDataProductWithRationale",
+    (vars, axiosOptions) =>
+      approveDataProductWithRationale(vars.productId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );
+
+export const useRejectDataProductWithRationale = (options?: {
+  mutation?: UseMutationOptions<
+    AxiosResponse<unknown>,
+    AxiosError<unknown>,
+    { productId: string } & LifecycleVars,
+    unknown
+  >;
+  axios?: AxiosRequestConfig;
+}) =>
+  useLifecyclePost(
+    "rejectDataProductWithRationale",
+    (vars, axiosOptions) =>
+      rejectDataProductWithRationale(vars.productId, { rationale: vars.rationale ?? null }, axiosOptions),
+    options,
+  );

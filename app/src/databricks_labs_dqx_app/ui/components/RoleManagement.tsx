@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Card,
@@ -9,12 +10,6 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -24,14 +19,21 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Users,
   Plus,
   Trash2,
   Shield,
   AlertCircle,
-  ChevronsUpDown,
-  Check,
-  Search,
   Loader2,
   Info,
 } from "lucide-react";
@@ -41,11 +43,27 @@ import {
   listRoleMappings,
   createRoleMapping,
   deleteRoleMapping,
-  listWorkspaceGroups,
   listAvailableRoles,
   getListRoleMappingsQueryKey,
+  useListPrivilegedPrincipals,
+  type PrivilegedPrincipalOut,
+  PrivilegedPrincipalOutKind,
+  type PrincipalSearchOut,
 } from "@/lib/api";
-import { cn } from "@/lib/utils";
+/** Best-effort OS detection for the hard-refresh keyboard hint. Falls back to
+ *  the Ctrl form off-Mac (and when userAgentData/platform is unavailable). */
+function hardRefreshShortcut(): string {
+  const nav =
+    typeof navigator !== "undefined"
+      ? (navigator as Navigator & { userAgentData?: { platform?: string } })
+      : undefined;
+  const platform = nav?.userAgentData?.platform || nav?.platform || nav?.userAgent || "";
+  return /mac|iphone|ipad|ipod/i.test(platform) ? "⌘+R" : "Ctrl+R";
+}
+import {
+  PrincipalPicker,
+  type PickedPrincipal,
+} from "@/components/permissions/PrincipalPicker";
 
 /**
  * Pull the server-supplied ``detail`` off a FastAPI error if we can,
@@ -55,196 +73,37 @@ import { cn } from "@/lib/utils";
  * actually needs to see — the previous "Failed to create mapping.
  * Please try again." banner was hiding all of it.
  */
-function extractRoleMappingError(err: unknown): string {
+function extractRoleMappingError(err: unknown, fallback: string): string {
   if (isAxiosError(err)) {
     const detail = (err.response?.data as { detail?: unknown } | undefined)?.detail;
     if (typeof detail === "string" && detail.trim()) return detail;
     if (err.message) return err.message;
   }
   if (err instanceof Error && err.message) return err.message;
-  return "Failed to create role mapping. Check the backend logs for details.";
+  return fallback;
 }
 
-const GROUP_SEARCH_DEBOUNCE_MS = 250;
-// Server-side cap matches the FastAPI route's ``limit`` default. Going
-// higher does little for UX (nobody scrolls 200+ items in a popover) and
-// keeps SCIM responses snappy on huge workspaces.
-const GROUP_SEARCH_LIMIT = 200;
-
-/**
- * Searchable group picker backed by the server-side
- * ``GET /api/v1/roles/groups?search=&limit=`` endpoint.
- *
- * The previous implementation eagerly fetched every workspace group and
- * rendered them in a Radix Select. On workspaces with thousands of groups
- * (each carrying its full member roster in the SCIM payload) this would
- * stall at "Loading…" for many seconds — sometimes indefinitely. We now
- * push the matching to SCIM via ``filter=displayName co "..."`` and only
- * render the top ``GROUP_SEARCH_LIMIT`` matches, refetched as the user
- * types (debounced).
- */
-function GroupCombobox({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (groupName: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [searchInput, setSearchInput] = useState("");
-  const [debouncedSearch, setDebouncedSearch] = useState("");
-  const inputRef = useRef<HTMLInputElement | null>(null);
-
-  // Debounce so we don't fire one SCIM call per keystroke.
-  useEffect(() => {
-    const t = setTimeout(
-      () => setDebouncedSearch(searchInput.trim()),
-      GROUP_SEARCH_DEBOUNCE_MS,
-    );
-    return () => clearTimeout(t);
-  }, [searchInput]);
-
-  const {
-    data: groupsData,
-    isLoading,
-    isFetching,
-    error,
-  } = useQuery({
-    queryKey: ["workspaceGroups", debouncedSearch],
-    queryFn: () =>
-      listWorkspaceGroups({
-        search: debouncedSearch || undefined,
-        limit: GROUP_SEARCH_LIMIT,
-      }),
-    // Same group list rarely changes mid-session; cache it for a minute
-    // to avoid refetching when the user reopens the popover.
-    staleTime: 60_000,
-  });
-
-  const groups = groupsData?.data || [];
-  const reachedLimit = groups.length >= GROUP_SEARCH_LIMIT;
-
-  const handleSelect = (groupName: string) => {
-    onChange(groupName);
-    setOpen(false);
-    setSearchInput("");
-  };
-
-  return (
-    <Popover
-      open={open}
-      onOpenChange={(next) => {
-        setOpen(next);
-        if (next) {
-          // Defer focus so Radix's portal mount completes first.
-          requestAnimationFrame(() => inputRef.current?.focus());
-        } else {
-          setSearchInput("");
-        }
-      }}
-    >
-      <PopoverTrigger asChild>
-        <Button
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          className="w-full justify-between font-normal"
-        >
-          <span className={cn(!value && "text-muted-foreground")}>
-            {value || "Select group..."}
-          </span>
-          <ChevronsUpDown className="h-4 w-4 opacity-50 shrink-0" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        className="p-0 w-[--radix-popover-trigger-width] min-w-[280px]"
-        align="start"
-      >
-        <div className="flex items-center gap-2 border-b px-3 py-2">
-          <Search className="h-4 w-4 text-muted-foreground shrink-0" />
-          <Input
-            ref={inputRef}
-            value={searchInput}
-            onChange={(e) => setSearchInput(e.target.value)}
-            placeholder="Search groups..."
-            className="border-0 shadow-none focus-visible:ring-0 px-0 h-8"
-          />
-          {isFetching && !isLoading ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />
-          ) : null}
-        </div>
-        <div className="max-h-64 overflow-y-auto py-1">
-          {isLoading ? (
-            <div className="px-3 py-6 text-center text-sm text-muted-foreground">
-              Loading...
-            </div>
-          ) : error ? (
-            <div className="px-3 py-6 text-center text-sm text-destructive">
-              Failed to load groups
-            </div>
-          ) : groups.length === 0 ? (
-            <div className="px-3 py-6 text-center text-sm text-muted-foreground">
-              {debouncedSearch
-                ? "No groups match that search"
-                : "No groups found"}
-            </div>
-          ) : (
-            <>
-              {groups.map((group) => {
-                const name = group.display_name;
-                const selected = name === value;
-                return (
-                  <button
-                    key={`${group.id ?? name}`}
-                    type="button"
-                    onClick={() => handleSelect(name)}
-                    className={cn(
-                      "w-full flex items-center gap-2 px-3 py-1.5 text-sm text-left",
-                      "hover:bg-accent hover:text-accent-foreground",
-                      "focus:bg-accent focus:text-accent-foreground focus:outline-none",
-                    )}
-                  >
-                    <Check
-                      className={cn(
-                        "h-4 w-4 shrink-0",
-                        selected ? "opacity-100" : "opacity-0",
-                      )}
-                    />
-                    <span className="truncate">{name}</span>
-                  </button>
-                );
-              })}
-              {reachedLimit ? (
-                <div className="px-3 py-2 text-xs text-muted-foreground border-t mt-1">
-                  Showing first {GROUP_SEARCH_LIMIT} matches — refine your
-                  search to narrow results.
-                </div>
-              ) : null}
-            </>
-          )}
-        </div>
-      </PopoverContent>
-    </Popover>
-  );
+function getRoleLabel(role: string, t: (key: string) => string): string {
+  switch (role) {
+    case "admin": return t("roleManagement.roleAdmin");
+    case "rule_approver": return t("roleManagement.roleApprover");
+    case "rule_author": return t("roleManagement.roleAuthor");
+    case "viewer": return t("roleManagement.roleViewer");
+    case "runner": return t("roleManagement.roleRunner");
+    default: return role;
+  }
 }
 
-const ROLE_LABELS: Record<string, string> = {
-  admin: "Admin",
-  rule_approver: "Approver",
-  rule_author: "Author",
-  viewer: "Viewer",
-  runner: "Runner",
-};
-
-const ROLE_DESCRIPTIONS: Record<string, string> = {
-  admin: "Full access including role management (admins are implicit runners)",
-  rule_approver: "Can approve/reject rules and all author permissions",
-  rule_author: "Can create, edit, and submit rules",
-  viewer: "Read-only access to rules",
-  // Runner is intentionally additive — assigning it does NOT grant author
-  // or approver privileges. It only unlocks the Run Rules page.
-  runner: "Can run approved rules from the Run Rules page (additive — independent of other roles)",
-};
+function getRoleDescription(role: string, t: (key: string) => string): string {
+  switch (role) {
+    case "admin": return t("roleManagement.roleAdminDescription");
+    case "rule_approver": return t("roleManagement.roleApproverDescription");
+    case "rule_author": return t("roleManagement.roleAuthorDescription");
+    case "viewer": return t("roleManagement.roleViewerDescription");
+    case "runner": return t("roleManagement.roleRunnerDescription");
+    default: return "";
+  }
+}
 
 function RoleMappingRow({
   mapping,
@@ -255,20 +114,22 @@ function RoleMappingRow({
   onDelete: () => void;
   isDeleting: boolean;
 }) {
+  const { t } = useTranslation();
   return (
-    <div className="flex items-center justify-between py-2 px-3 bg-muted/30 rounded-md">
+    <div className="flex items-center justify-between rounded-md border bg-muted/30 p-3">
       <div className="flex items-center gap-3">
-        <Badge variant="outline" className="font-mono">
-          {ROLE_LABELS[mapping.role] || mapping.role}
-        </Badge>
-        <span className="text-sm text-muted-foreground">→</span>
         <span className="font-medium">{mapping.group_name}</span>
+        <span className="text-sm text-muted-foreground">→</span>
+        <Badge variant="outline" className="font-mono">
+          {getRoleLabel(mapping.role, t)}
+        </Badge>
       </div>
       <Button
         variant="ghost"
         size="sm"
         onClick={onDelete}
         disabled={isDeleting}
+        aria-label={t("roleManagement.deleteMappingAria", { role: getRoleLabel(mapping.role, t), group: mapping.group_name })}
         className="text-destructive hover:text-destructive hover:bg-destructive/10"
       >
         <Trash2 className="h-4 w-4" />
@@ -277,35 +138,51 @@ function RoleMappingRow({
   );
 }
 
+/** A disabled row representing a workspace admin or app owner — no delete affordance. */
+function PrivilegedPrincipalRow({ principal }: { principal: PrivilegedPrincipalOut }) {
+  const { t } = useTranslation();
+  const suffix =
+    principal.kind === PrivilegedPrincipalOutKind.workspace_admin
+      ? t("roleManagement.suffixWorkspaceAdmin")
+      : t("roleManagement.suffixAppOwner");
+  return (
+    <div className="flex items-center justify-between rounded-md border bg-muted/20 p-3 opacity-60">
+      <div className="flex items-center gap-3">
+        <span className="font-medium">{principal.principal}</span>
+        <span className="text-sm text-muted-foreground">{suffix}</span>
+      </div>
+      {/* No delete button — implicit elevated access */}
+    </div>
+  );
+}
+
 /**
- * Form state is owned by the parent so that:
+ * Inline form for adding a new entitlement.
  *
- *   1. The values aren't blown away on click (the mutation is fired
- *      synchronously but resolves async — clearing on click means a
- *      slow request "vanishes" the user's selections, leaving them
- *      with no idea whether anything happened).
- *   2. On error we leave the role/group selected so the user can fix
- *      whatever the server complained about and retry without
- *      re-picking from scratch.
- *   3. The parent decides when to clear (only on a *confirmed* server
- *      success) via the ``resetSignal`` prop, which the form watches
- *      with ``useEffect``.
+ * Auto-submits when both a User/Group and an Entitlement are selected
+ * (no explicit "Add" button needed for the in-progress selection). The
+ * `resetSignal` prop is incremented by the parent on a confirmed server
+ * success, clearing the local selections so the form is ready for the
+ * next mapping.
  */
-function AddRoleMappingForm({
-  selectedRole,
-  setSelectedRole,
-  selectedGroup,
-  setSelectedGroup,
+function AddEntitlementForm({
   onAdd,
   isAdding,
+  existingMappings,
+  resetSignal,
 }: {
-  selectedRole: string;
-  setSelectedRole: (role: string) => void;
-  selectedGroup: string;
-  setSelectedGroup: (group: string) => void;
   onAdd: (role: string, groupName: string) => void;
   isAdding: boolean;
+  existingMappings: { role: string; group_name: string }[];
+  resetSignal: number;
 }) {
+  const { t } = useTranslation();
+  const [pickedPrincipal, setPickedPrincipal] = useState<PickedPrincipal | null>(null);
+  const [selectedRole, setSelectedRole] = useState<string>("");
+  // Guard against re-firing the same principal+role pair (strict-mode double
+  // invocations, rapid state changes, or duplicate selections).
+  const lastFiredRef = useRef<string>("");
+
   const { data: rolesData } = useQuery({
     queryKey: ["availableRoles"],
     queryFn: () => listAvailableRoles(),
@@ -313,27 +190,74 @@ function AddRoleMappingForm({
 
   const roles = rolesData?.data || [];
 
-  const handleAdd = () => {
-    if (selectedRole && selectedGroup) {
-      onAdd(selectedRole, selectedGroup);
+  // Reset local selections whenever the parent signals a successful add.
+  useEffect(() => {
+    setPickedPrincipal(null);
+    setSelectedRole("");
+    lastFiredRef.current = "";
+  }, [resetSignal]);
+
+  // Auto-add as soon as both fields are filled in.
+  useEffect(() => {
+    if (!pickedPrincipal || !selectedRole || isAdding) return;
+    const pairKey = `${selectedRole}:${pickedPrincipal.principal_name}`;
+    if (lastFiredRef.current === pairKey) return;
+    const isDuplicate = existingMappings.some(
+      (m) => m.role === selectedRole && m.group_name === pickedPrincipal.principal_name,
+    );
+    if (isDuplicate) {
+      toast.info(t("roleManagement.mappingAlreadyExists"));
+      return;
     }
+    lastFiredRef.current = pairKey;
+    onAdd(selectedRole, pickedPrincipal.principal_name);
+  }, [pickedPrincipal, selectedRole, isAdding, existingMappings, onAdd]);
+
+  const handleSelect = (p: PrincipalSearchOut) => {
+    setPickedPrincipal({
+      principal_id: p.workspace_principal_id,
+      principal_type: p.kind,
+      principal_name: p.display_name,
+    });
+  };
+
+  const handleClear = () => {
+    setPickedPrincipal(null);
+    lastFiredRef.current = "";
   };
 
   return (
-    <div className="flex items-end gap-3 pt-4 border-t">
-      <div className="flex-1 space-y-1">
-        <label className="text-sm font-medium">Role</label>
-        <Select value={selectedRole} onValueChange={setSelectedRole} disabled={isAdding}>
-          <SelectTrigger>
-            <SelectValue placeholder="Select role..." />
+    <div className="flex flex-wrap items-start gap-3">
+      {/* User/Group */}
+      <div className="space-y-1.5">
+        <label className="block text-sm font-medium">{t("roleManagement.databricksGroup")}</label>
+        <PrincipalPicker
+          value={pickedPrincipal}
+          onSelect={handleSelect}
+          onClear={handleClear}
+          disabled={isAdding}
+          className="w-56"
+        />
+      </div>
+
+      {/* Entitlement — trigger shows the entitlement name only, left-aligned */}
+      <div className="space-y-1.5">
+        <label className="block text-sm font-medium">{t("roleManagement.role")}</label>
+        <Select value={selectedRole || undefined} onValueChange={setSelectedRole} disabled={isAdding}>
+          <SelectTrigger className="w-64 justify-between">
+            {/* Explicit children override Radix's default (which would echo the
+                item's two-line content) so the trigger shows the name only. */}
+            <SelectValue placeholder={t("roleManagement.selectRole")}>
+              {selectedRole ? getRoleLabel(selectedRole, t) : undefined}
+            </SelectValue>
           </SelectTrigger>
           <SelectContent>
             {roles.map((role) => (
-              <SelectItem key={role} value={role}>
-                <div className="flex flex-col">
-                  <span>{ROLE_LABELS[role] || role}</span>
+              <SelectItem key={role} value={role} textValue={getRoleLabel(role, t)}>
+                <div className="flex flex-col text-left">
+                  <span>{getRoleLabel(role, t)}</span>
                   <span className="text-xs text-muted-foreground">
-                    {ROLE_DESCRIPTIONS[role]}
+                    {getRoleDescription(role, t)}
                   </span>
                 </div>
               </SelectItem>
@@ -342,34 +266,22 @@ function AddRoleMappingForm({
         </Select>
       </div>
 
-      <div className="flex-1 space-y-1">
-        <label className="text-sm font-medium">Databricks Group</label>
-        <GroupCombobox value={selectedGroup} onChange={setSelectedGroup} />
-      </div>
-
-      <Button
-        onClick={handleAdd}
-        disabled={!selectedRole || !selectedGroup || isAdding}
-        className="shrink-0"
-      >
-        {isAdding ? (
-          <Loader2 className="h-4 w-4 mr-1 animate-spin" />
-        ) : (
-          <Plus className="h-4 w-4 mr-1" />
-        )}
-        {isAdding ? "Adding…" : "Add"}
-      </Button>
+      {isAdding && (
+        <Loader2 className="h-4 w-4 animate-spin text-muted-foreground self-center mt-6" />
+      )}
     </div>
   );
 }
 
 export function RoleManagement() {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
-  // Form values live up here so we can keep them across a slow/failed
-  // mutation. They're cleared in the mutation's ``onSuccess`` handler.
-  const [selectedRole, setSelectedRole] = useState<string>("");
-  const [selectedGroup, setSelectedGroup] = useState<string>("");
+  const [pendingDelete, setPendingDelete] = useState<{ role: string; group: string } | null>(null);
+  // Whether to show the inline "add entitlement" form.
+  const [showAddForm, setShowAddForm] = useState(false);
+  // Incremented on successful add so AddEntitlementForm resets its local state.
+  const [resetSignal, setResetSignal] = useState(0);
 
   const {
     data: mappingsData,
@@ -380,27 +292,28 @@ export function RoleManagement() {
     queryFn: () => listRoleMappings(),
   });
 
+  const { data: privilegedData } = useListPrivilegedPrincipals({
+    query: { select: (d) => d.data },
+  });
+  const privilegedPrincipals: PrivilegedPrincipalOut[] = privilegedData ?? [];
+
   const createMutation = useMutation({
     mutationFn: ({ role, groupName }: { role: string; groupName: string }) =>
       createRoleMapping({ role, group_name: groupName }),
     onSuccess: async (_data, variables) => {
-      // Refetch (not just invalidate) so the new row is visible the
-      // moment the success toast fires. Without ``await``, the toast
-      // can race ahead of the network roundtrip and the user briefly
-      // sees the old list.
       await queryClient.refetchQueries({ queryKey: getListRoleMappingsQueryKey() });
-      setSelectedRole("");
-      setSelectedGroup("");
-      const roleLabel = ROLE_LABELS[variables.role] ?? variables.role;
-      toast.success(`Mapping added: ${roleLabel} → ${variables.groupName}`, {
-        description:
-          "Stored in dq_role_mappings. Active sessions pick up the new role within ~1 minute (or on next page navigation).",
+      // Signal the form to reset and hide it.
+      setResetSignal((n) => n + 1);
+      setShowAddForm(false);
+      const roleLabel = getRoleLabel(variables.role, t);
+      toast.success(t("roleManagement.mappingAdded", { role: roleLabel, group: variables.groupName }), {
+        description: t("roleManagement.mappingAddedDescription"),
         duration: 6000,
       });
     },
     onError: (err) => {
-      toast.error("Failed to create role mapping", {
-        description: extractRoleMappingError(err),
+      toast.error(t("roleManagement.failedCreate"), {
+        description: extractRoleMappingError(err, t("roleManagement.fallbackError")),
         duration: 8000,
       });
     },
@@ -412,16 +325,15 @@ export function RoleManagement() {
     onSuccess: async (_data, variables) => {
       await queryClient.refetchQueries({ queryKey: getListRoleMappingsQueryKey() });
       setDeletingKey(null);
-      toast.success(`Removed mapping: ${variables.role} → ${variables.groupName}`, {
-        description:
-          "Affected users may keep their previous role for up to ~1 minute until their session refreshes.",
+      toast.success(t("roleManagement.mappingRemoved", { role: variables.role, group: variables.groupName }), {
+        description: t("roleManagement.mappingRemovedDescription"),
         duration: 6000,
       });
     },
     onError: (err) => {
       setDeletingKey(null);
-      toast.error("Failed to delete role mapping", {
-        description: extractRoleMappingError(err),
+      toast.error(t("roleManagement.failedDelete"), {
+        description: extractRoleMappingError(err, t("roleManagement.fallbackError")),
         duration: 8000,
       });
     },
@@ -429,14 +341,21 @@ export function RoleManagement() {
 
   const mappings = mappingsData?.data || [];
 
-  const handleAdd = (role: string, groupName: string) => {
+  const handleAdd = useCallback((role: string, groupName: string) => {
     createMutation.mutate({ role, groupName });
+  }, [createMutation]);
+
+  const handleDeleteRequest = (role: string, groupName: string) => {
+    setPendingDelete({ role, group: groupName });
   };
 
-  const handleDelete = (role: string, groupName: string) => {
-    const key = `${role}:${groupName}`;
+  const confirmDelete = () => {
+    if (!pendingDelete) return;
+    const { role, group } = pendingDelete;
+    const key = `${role}:${group}`;
     setDeletingKey(key);
-    deleteMutation.mutate({ role, groupName });
+    setPendingDelete(null);
+    deleteMutation.mutate({ role, groupName: group });
   };
 
   if (isLoading) {
@@ -445,7 +364,7 @@ export function RoleManagement() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Shield className="h-5 w-5" />
-            Role Management
+            {t("roleManagement.title")}
           </CardTitle>
         </CardHeader>
         <CardContent>
@@ -465,41 +384,34 @@ export function RoleManagement() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Shield className="h-5 w-5" />
-            Role Management
+            {t("roleManagement.title")}
           </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex items-center gap-2 text-destructive">
             <AlertCircle className="h-4 w-4" />
-            <span>Failed to load role mappings</span>
+            <span>{t("roleManagement.failedLoad")}</span>
           </div>
         </CardContent>
       </Card>
     );
   }
 
+  const hasRows = mappings.length > 0 || privilegedPrincipals.length > 0;
+
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Shield className="h-5 w-5" />
-          Role Management
+          {t("roleManagement.title")}
         </CardTitle>
         <CardDescription>
-          Map Databricks workspace groups to application roles. Users inherit
-          the highest-priority role from their group memberships.
+          {t("roleManagement.description")}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/*
-          Propagation-delay disclosure. The frontend caches each user's
-          resolved role in React Query with ``staleTime: 60_000`` (see
-          ``ui/lib/route-guards.ts``), so a user whose group was just
-          mapped — or unmapped — keeps their old role until the cache
-          revalidates: at most ~1 minute, or sooner if they navigate.
-          Surfacing this here so admins don't second-guess a successful
-          assignment and re-toggle the mapping.
-        */}
+        {/* Propagation-delay disclosure */}
         <div
           className="flex items-start gap-2 rounded-md border border-border bg-muted/40 p-3 text-sm text-muted-foreground"
           role="note"
@@ -507,35 +419,35 @@ export function RoleManagement() {
           <Info className="h-4 w-4 mt-0.5 shrink-0 text-foreground/70" />
           <div>
             <p className="text-foreground/90">
-              Role changes take up to <span className="font-medium">~1 minute</span> to
-              reach an active session.
+              {t("roleManagement.delayTitle")}
             </p>
             <p className="text-xs mt-0.5">
-              Each user&apos;s resolved role is cached client-side for 60 seconds. After a
-              mapping is added or removed, the affected user keeps their previous role
-              until their session revalidates (which also happens immediately on any
-              page navigation). A hard refresh applies the new role straight away.
+              {t("roleManagement.delayBody", { shortcut: hardRefreshShortcut() })}
             </p>
           </div>
         </div>
 
-        {mappings.length === 0 ? (
+        {/* Entitlement rows — real mappings + privileged principals */}
+        {!hasRows ? (
           <div className="text-center py-6 text-muted-foreground">
             <Users className="h-8 w-8 mx-auto mb-2 opacity-50" />
-            <p>No role mappings configured.</p>
+            <p>{t("roleManagement.noMappings")}</p>
             <p className="text-sm">
-              Add a mapping below to assign roles to Databricks groups.
+              {t("roleManagement.addMappingHint")}
             </p>
           </div>
         ) : (
           <div className="space-y-2">
+            {privilegedPrincipals.map((p) => (
+              <PrivilegedPrincipalRow key={`${p.kind}:${p.principal}`} principal={p} />
+            ))}
             {mappings.map((mapping) => {
               const key = `${mapping.role}:${mapping.group_name}`;
               return (
                 <RoleMappingRow
                   key={key}
                   mapping={mapping}
-                  onDelete={() => handleDelete(mapping.role, mapping.group_name)}
+                  onDelete={() => handleDeleteRequest(mapping.role, mapping.group_name)}
                   isDeleting={deletingKey === key}
                 />
               );
@@ -543,15 +455,59 @@ export function RoleManagement() {
           </div>
         )}
 
-        <AddRoleMappingForm
-          selectedRole={selectedRole}
-          setSelectedRole={setSelectedRole}
-          selectedGroup={selectedGroup}
-          setSelectedGroup={setSelectedGroup}
-          onAdd={handleAdd}
-          isAdding={createMutation.isPending}
-        />
+        {/* Inline add form — revealed on button click */}
+        {showAddForm && (
+          <AddEntitlementForm
+            onAdd={handleAdd}
+            isAdding={createMutation.isPending}
+            existingMappings={mappings}
+            resetSignal={resetSignal}
+          />
+        )}
+
+        {/* "Add new entitlement" sits below the rows */}
+        {!showAddForm && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowAddForm(true)}
+            className="gap-1.5"
+          >
+            <Plus className="h-4 w-4" />
+            {t("roleManagement.add")}
+          </Button>
+        )}
       </CardContent>
+
+      <AlertDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDelete(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("roleManagement.deleteMappingTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDelete
+                ? t("roleManagement.deleteMappingBody", {
+                    role: getRoleLabel(pendingDelete.role, t),
+                    group: pendingDelete.group,
+                  })
+                : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmDelete}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {t("common.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Card>
   );
 }

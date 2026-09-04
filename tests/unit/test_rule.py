@@ -1,8 +1,13 @@
-"""Unit tests for rule fingerprinting, expansion, and serialization alignment."""
+"""Unit tests for rule fingerprinting, replacement, expansion, and serialization alignment."""
 
+from collections.abc import Iterator
+from enum import Enum
 import re
 
-from databricks.labs.dqx.check_funcs import is_not_null, is_not_null_and_not_empty
+import pytest
+
+from databricks.labs.dqx.check_funcs import is_not_null, is_not_null_and_not_empty, is_unique
+from databricks.labs.dqx.errors import InvalidCheckError
 from databricks.labs.dqx.rule import DQRowRule
 from databricks.labs.dqx.rule_fingerprint import (
     compute_rule_fingerprint,
@@ -26,6 +31,37 @@ def test_compute_rule_fingerprint_same_rule_same_fingerprint():
     fp2 = compute_rule_fingerprint(check)
     assert fp1 == fp2
     assert _hex_sha256_pattern().match(fp1)
+
+
+def test_compute_rule_fingerprint_set_arguments_order_independent():
+    """Set arguments with mixed nested values produce the same fingerprint in any iteration order."""
+
+    class NestedValue(Enum):
+        DICT = {"nested": [1, "1"]}
+
+    class IterationOrderedSet(set[object]):
+        def __init__(self, values: list[object]) -> None:
+            super().__init__(values)
+            self.iteration_order = values
+
+        def __iter__(self) -> Iterator[object]:
+            return iter(self.iteration_order)
+
+    values = [NestedValue.DICT, 1, "1", ("pair", 2), frozenset({3, "3"})]
+    check = {"check": {"function": "is_in_list", "arguments": {"allowed": IterationOrderedSet(values)}}}
+    reversed_check = {
+        "check": {"function": "is_in_list", "arguments": {"allowed": IterationOrderedSet(list(reversed(values)))}}
+    }
+    plain_set_check = {"check": {"function": "is_in_list", "arguments": {"allowed": set(values)}}}
+
+    fingerprint = compute_rule_fingerprint(check)
+    assert fingerprint == compute_rule_fingerprint(reversed_check)
+    # The custom subclass canonicalizes to the same fingerprint as a plain set of the same values.
+    assert fingerprint == compute_rule_fingerprint(plain_set_check)
+
+    # A set with different values must produce a different fingerprint (sort does not collapse distinct inputs).
+    different_check = {"check": {"function": "is_in_list", "arguments": {"allowed": {1, "1", ("pair", 2)}}}}
+    assert compute_rule_fingerprint(different_check) != fingerprint
 
 
 def test_compute_rule_set_fingerprint_by_metadata_same_set_same_fingerprint():
@@ -282,3 +318,59 @@ def test_compute_rule_fingerprint_none_arguments_same_as_empty():
     fp_none = compute_rule_fingerprint(check_none_args)
     fp_empty = compute_rule_fingerprint(check_empty_args)
     assert fp_none == fp_empty
+
+
+def test_dq_rule_replace_returns_new_instance_with_overrides_and_preserves_other_fields():
+    """`replace()` returns a new rule of the same concrete type with overrides applied and other
+    fields preserved, leaving the original (frozen) instance untouched."""
+    rule = DQRowRule(name="id_not_null", criticality="error", check_func=is_not_null, column="id")
+
+    replaced = rule.replace(criticality="warn")
+
+    assert replaced is not rule
+    assert isinstance(replaced, DQRowRule)
+    assert replaced.criticality == "warn"  # overridden
+    assert replaced.column == "id"  # preserved
+    assert replaced.check_func is is_not_null  # preserved
+    assert replaced.name == "id_not_null"  # preserved
+    assert rule.criticality == "error"  # original is frozen and must be untouched
+
+
+def test_dq_rule_replace_recomputes_cached_fingerprint_from_updated_fields():
+    """`replace()` recomputes `functools.cached_property` state instead of copying it stale.
+
+    `rule_fingerprint` is cached and derived from the rule's fields. After the cache is populated,
+    replacing a fingerprint-affecting field must yield the fingerprint of an equivalently-built rule,
+    not the stale pre-replace value. A shallow `model_copy(update=...)` would carry over the cached
+    hash and fail this assertion."""
+    # `name` is part of the fingerprint, so it is held constant across rule/replaced/expected to
+    # isolate `column` as the only fingerprint-affecting difference.
+    rule = DQRowRule(name="shared", criticality="error", check_func=is_not_null, column="id")
+    original_fingerprint = rule.rule_fingerprint  # populate the cached_property before replacing
+
+    replaced = rule.replace(column="other_col")
+
+    expected = DQRowRule(name="shared", criticality="error", check_func=is_not_null, column="other_col")
+    assert replaced.rule_fingerprint == expected.rule_fingerprint
+    assert replaced.rule_fingerprint != original_fingerprint
+
+
+def test_dq_rule_replace_reruns_validation():
+    """`replace()` rebuilds through the constructor, so validators re-run against the new fields.
+
+    Swapping a dataset-level function onto a row-level rule must raise `InvalidCheckError`; a shallow
+    `model_copy(update=...)` would skip validation and silently produce an invalid rule."""
+    rule = DQRowRule(name="id_not_null", criticality="error", check_func=is_not_null, column="id")
+
+    with pytest.raises(InvalidCheckError):
+        rule.replace(check_func=is_unique)
+
+
+def test_dq_rule_rejects_unknown_kwarg():
+    """Unknown/misspelled kwargs must be rejected, not silently dropped (extra='forbid').
+
+    Regression: the Pydantic migration defaulted to extra='ignore', so a typo like
+    'colummn' was accepted and dropped where the pre-migration dataclass raised TypeError.
+    """
+    with pytest.raises(InvalidCheckError):
+        DQRowRule(check_func=is_not_null, column="id", colummn="typo")

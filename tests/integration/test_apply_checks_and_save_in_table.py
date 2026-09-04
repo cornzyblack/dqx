@@ -12,7 +12,8 @@ from databricks.labs.dqx.config import (
     TableChecksStorageConfig,
 )
 from databricks.labs.dqx.engine import DQEngine
-from databricks.labs.dqx.errors import InvalidConfigError
+from databricks.labs.dqx.errors import InvalidConfigError, InvalidParameterError
+from databricks.labs.dqx.metrics_observer import DQMetricsObserver
 from databricks.labs.dqx.rule import DQRowRule, DQDatasetRule
 from tests.integration.conftest import (
     EXTRA_PARAMS,
@@ -28,8 +29,8 @@ from tests.constants import TEST_CATALOG
 def test_apply_checks_and_save_in_single_table(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int, c: string"
@@ -111,9 +112,9 @@ def test_apply_checks_and_save_in_single_table(ws, spark, make_schema, make_rand
 def test_apply_checks_and_save_in_single_table_with_quarantine(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    quarantine_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    quarantine_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int, c: string"
@@ -177,8 +178,8 @@ def test_apply_checks_and_save_in_single_table_with_quarantine(ws, spark, make_s
 def test_apply_checks_by_metadata_and_save_in_single_table(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int, c: string"
@@ -258,9 +259,9 @@ def test_apply_checks_by_metadata_and_save_in_single_table(ws, spark, make_schem
 def test_apply_checks_by_metadata_and_save_in_single_table_with_quarantine(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    quarantine_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    quarantine_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int, c: string"
@@ -320,11 +321,125 @@ def test_apply_checks_by_metadata_and_save_in_single_table_with_quarantine(ws, s
     assert_df_equality(actual_quarantine_df, expected_quarantine_df, ignore_nullable=True)
 
 
+def test_apply_checks_by_metadata_and_save_in_table_quarantine_only(ws, spark, make_schema, make_random):
+    catalog_name = TEST_CATALOG
+    schema = make_schema(catalog_name=catalog_name)
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    quarantine_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+
+    test_schema = "a: int, b: int, c: string"
+    test_df = spark.createDataFrame([[1, 2, "valid"], [None, 3, "invalid"], [4, 5, "good"]], test_schema)
+    test_df.write.format("delta").mode("overwrite").saveAsTable(input_table)
+
+    checks = [
+        {
+            "name": "a_is_null",
+            "criticality": "error",
+            "check": {"function": "is_not_null", "arguments": {"column": "a"}},
+        },
+    ]
+
+    # Apply checks with only a quarantine table configured (no output_config for valid records)
+    engine = DQEngine(ws, spark=spark, extra_params=EXTRA_PARAMS)
+    engine.apply_checks_by_metadata_and_save_in_table(
+        checks=checks,
+        input_config=InputConfig(location=input_table),
+        quarantine_config=OutputConfig(
+            location=quarantine_table, mode="overwrite", options={"overwriteSchema": "true"}
+        ),
+    )
+
+    actual_quarantine_df = spark.table(quarantine_table)
+    quarantine_schema = test_schema + REPORTING_COLUMNS
+    expected_quarantine_df = spark.createDataFrame(
+        [
+            [
+                None,
+                3,
+                "invalid",
+                [
+                    {
+                        "name": "a_is_null",
+                        "message": "Column 'a' value is null",
+                        "columns": ["a"],
+                        "filter": None,
+                        "function": "is_not_null",
+                        "run_time": RUN_TIME,
+                        "run_id": RUN_ID,
+                        "user_metadata": {},
+                    }
+                ],
+                None,
+            ]
+        ],
+        schema=quarantine_schema,
+    )
+
+    assert_df_equality(actual_quarantine_df, expected_quarantine_df, ignore_nullable=True)
+
+
+def test_apply_checks_and_save_in_table_quarantine_only(ws, spark, make_schema, make_random):
+    catalog_name = TEST_CATALOG
+    schema = make_schema(catalog_name=catalog_name)
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    quarantine_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+
+    test_schema = "a: int, b: int, c: string"
+    test_df = spark.createDataFrame([[1, 2, "valid"], [None, 3, "invalid"], [4, 5, "good"]], test_schema)
+    test_df.write.format("delta").mode("overwrite").saveAsTable(input_table)
+
+    checks = [
+        DQRowRule(
+            name="a_is_null",
+            criticality="error",
+            check_func=check_funcs.is_not_null,
+            column="a",
+        ),
+    ]
+
+    engine = DQEngine(ws, spark=spark, extra_params=EXTRA_PARAMS)
+    engine.apply_checks_and_save_in_table(
+        checks=checks,
+        input_config=InputConfig(location=input_table),
+        quarantine_config=OutputConfig(
+            location=quarantine_table, mode="overwrite", options={"overwriteSchema": "true"}
+        ),
+    )
+
+    actual_quarantine_df = spark.table(quarantine_table)
+    quarantine_schema = test_schema + REPORTING_COLUMNS
+    expected_quarantine_df = spark.createDataFrame(
+        [
+            [
+                None,
+                3,
+                "invalid",
+                [
+                    {
+                        "name": "a_is_null",
+                        "message": "Column 'a' value is null",
+                        "columns": ["a"],
+                        "filter": None,
+                        "function": "is_not_null",
+                        "run_time": RUN_TIME,
+                        "run_id": RUN_ID,
+                        "user_metadata": {},
+                    }
+                ],
+                None,
+            ]
+        ],
+        schema=quarantine_schema,
+    )
+
+    assert_df_equality(actual_quarantine_df, expected_quarantine_df, ignore_nullable=True)
+
+
 def test_apply_checks_and_save_in_table_with_options(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int"
@@ -365,7 +480,7 @@ def test_apply_checks_and_save_in_table_with_options(ws, spark, make_schema, mak
     # Add more data with different schema to test schema evolution
     new_test_schema = "a: int, b: int, d: string"
     new_test_df = spark.createDataFrame([[5, 6, "new"]], new_test_schema)
-    new_input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    new_input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     new_test_df.write.format("delta").mode("overwrite").saveAsTable(new_input_table)
 
     engine.apply_checks_and_save_in_table(
@@ -391,8 +506,8 @@ def test_apply_checks_and_save_in_table_with_options(ws, spark, make_schema, mak
 def test_apply_checks_and_save_in_table_with_different_modes(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int"
@@ -447,7 +562,7 @@ def test_apply_checks_and_save_in_table_with_different_modes(ws, spark, make_sch
 
     # Second write with append mode
     new_test_df = spark.createDataFrame([[None, 4], [5, 6]], test_schema)
-    new_input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    new_input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     new_test_df.write.format("delta").mode("overwrite").saveAsTable(new_input_table)
 
     engine.apply_checks_and_save_in_table(
@@ -488,8 +603,8 @@ def test_apply_checks_and_save_in_table_with_different_modes(ws, spark, make_sch
 def test_apply_checks_by_metadata_and_save_in_table_with_custom_functions(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: string"
@@ -551,8 +666,8 @@ def test_apply_checks_by_metadata_and_save_in_table_with_custom_functions(ws, sp
 def test_apply_checks_and_save_in_table_with_custom_functions(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: string"
@@ -614,8 +729,8 @@ def test_apply_checks_and_save_in_table_with_custom_functions(ws, spark, make_sc
 def test_apply_checks_and_save_in_table_with_ref_df(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: string"
@@ -662,8 +777,8 @@ def test_apply_checks_and_save_in_table_with_ref_df(ws, spark, make_schema, make
 def test_apply_checks_by_metadata_and_save_in_table_with_ref_df(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: string"
@@ -708,8 +823,8 @@ def test_apply_checks_by_metadata_and_save_in_table_with_ref_df(ws, spark, make_
 def test_apply_checks_and_save_in_table_streaming_write(ws, spark, make_schema, make_random, make_volume):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     volume = make_volume(catalog_name=catalog_name, schema_name=schema.name)
     checkpoint_location = f"/Volumes/{volume.catalog_name}/{volume.schema_name}/{volume.name}/{make_random(8).lower()}"
 
@@ -767,11 +882,22 @@ def test_apply_checks_and_save_in_table_streaming_write(ws, spark, make_schema, 
     assert_df_equality(actual_df.sort("a"), expected_df.sort("a"), ignore_nullable=True)
 
 
+def test_apply_checks_and_save_in_table_streaming_metrics_only_unsupported(ws, spark):
+    engine = DQEngine(ws, spark=spark, observer=DQMetricsObserver(), extra_params=EXTRA_PARAMS)
+
+    with pytest.raises(InvalidParameterError, match="Metrics-only writes are not supported for streaming input"):
+        engine.apply_checks_and_save_in_table(
+            checks=[],
+            input_config=InputConfig(location="catalog.schema.input", is_streaming=True),
+            metrics_config=OutputConfig(location="catalog.schema.metrics"),
+        )
+
+
 def test_apply_checks_and_save_in_tables(ws, spark, make_schema, make_random, make_directory):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int, c: string"
@@ -864,8 +990,8 @@ def test_apply_checks_and_save_in_tables_streaming_write(
 ):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     volume = make_volume(catalog_name=catalog_name, schema_name=schema.name)
     checkpoint_location = f"/Volumes/{volume.catalog_name}/{volume.schema_name}/{volume.name}/{make_random(8).lower()}"
 
@@ -941,8 +1067,8 @@ def test_apply_checks_and_save_in_tables_multiple_tables(ws, spark, make_schema,
     schema = make_schema(catalog_name=catalog_name)
 
     # Create multiple input and output tables
-    input_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
-    output_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
+    input_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
+    output_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
 
     # Create test data for both tables
     test_schema = "a: int, b: string"
@@ -1054,9 +1180,9 @@ def test_apply_checks_and_save_in_tables_with_quarantine(ws, spark, make_schema,
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
 
-    input_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
-    output_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
-    quarantine_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
+    input_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
+    output_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
+    quarantine_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
 
     # Create test data
     test_schema = "a: int, b: string"
@@ -1154,8 +1280,8 @@ def test_apply_checks_and_save_in_tables_custom_parallelism(ws, spark, make_sche
     output_tables = []
 
     for i in range(4):
-        input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-        output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+        input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+        output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
         input_tables.append(input_table)
         output_tables.append(output_table)
@@ -1224,20 +1350,23 @@ def test_apply_checks_and_save_in_tables_missing_input_config(ws, spark):
         engine.apply_checks_and_save_in_tables(run_configs=[run_config])
 
 
-def test_apply_checks_and_save_in_tables_missing_output_config(ws, spark):
+def test_apply_checks_and_save_in_tables_missing_destination_configs(ws, spark):
     engine = DQEngine(ws, spark=spark, extra_params=EXTRA_PARAMS)
 
     run_config = RunConfig(input_config=InputConfig(location="some_table"))
 
-    with pytest.raises(InvalidConfigError, match="Output configuration not provided"):
+    with pytest.raises(
+        InvalidConfigError,
+        match="At least one of 'output_config', 'quarantine_config' or 'metrics_config' must be provided",
+    ):
         engine.apply_checks_and_save_in_tables(run_configs=[run_config])
 
 
 def test_apply_checks_and_save_in_tables_with_custom_functions(ws, spark, make_schema, make_random, make_directory):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data
     test_schema = "a: int, b: string"
@@ -1320,8 +1449,8 @@ def custom_string_check(column: str) -> Column:
 def test_apply_checks_and_save_in_tables_with_ref_df(ws, spark, make_schema, make_random, make_directory):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
 
     # Create test data
     test_schema = "a: int, b: string"
@@ -1377,7 +1506,7 @@ def test_apply_checks_and_save_in_tables_for_patterns(ws, spark, make_schema, ma
     schema = make_schema(catalog_name=catalog_name)
 
     # Create multiple input and output tables
-    input_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
+    input_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
     output_tables = [f"{table}_dq_output" for table in input_tables]
 
     # Create test data for both tables
@@ -1475,12 +1604,182 @@ def test_apply_checks_and_save_in_tables_for_patterns(ws, spark, make_schema, ma
     assert_df_equality(actual_df2, expected_df2, ignore_nullable=True)
 
 
+def test_apply_checks_and_save_in_tables_for_patterns_quarantine_only(
+    ws, spark, make_schema, make_random, make_directory
+):
+    catalog_name = TEST_CATALOG
+    schema = make_schema(catalog_name=catalog_name)
+
+    input_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
+    quarantine_tables = [f"{table}_dq_quarantine" for table in input_tables]
+    output_tables = [f"{table}_dq_output" for table in input_tables]
+
+    test_schema = "a: int, b: string"
+    test_df1 = spark.createDataFrame([[1, "valid"], [None, "invalid"]], test_schema)
+    test_df2 = spark.createDataFrame([[100, "test"], [200, None]], test_schema)
+
+    test_df1.write.format("delta").mode("overwrite").saveAsTable(input_tables[0])
+    test_df2.write.format("delta").mode("overwrite").saveAsTable(input_tables[1])
+
+    table1_checks = [
+        {
+            "name": "a_is_null",
+            "criticality": "error",
+            "check": {"function": "is_not_null", "arguments": {"column": "a"}},
+        }
+    ]
+    table2_checks = [
+        {
+            "name": "b_is_null",
+            "criticality": "error",
+            "check": {"function": "is_not_null", "arguments": {"column": "b"}},
+        }
+    ]
+
+    engine = DQEngine(ws, spark=spark, extra_params=EXTRA_PARAMS)
+    workspace_folder = str(make_directory().absolute())
+    checks_location1 = f"{workspace_folder}/{input_tables[0]}.yml"
+    checks_location2 = f"{workspace_folder}/{input_tables[1]}.yml"
+    engine.save_checks(table1_checks, config=WorkspaceFileChecksStorageConfig(location=checks_location1))
+    engine.save_checks(table2_checks, config=WorkspaceFileChecksStorageConfig(location=checks_location2))
+
+    engine.apply_checks_and_save_in_tables_for_patterns(
+        patterns=[f"{catalog_name}.{schema.name}.*"],
+        checks_location=workspace_folder,
+        run_config_template=RunConfig(quarantine_config=OutputConfig(location="", mode="overwrite")),
+    )
+
+    expected_schema = test_schema + REPORTING_COLUMNS
+    expected_quarantine_df1 = spark.createDataFrame(
+        [
+            [
+                None,
+                "invalid",
+                [
+                    {
+                        "name": "a_is_null",
+                        "message": "Column 'a' value is null",
+                        "columns": ["a"],
+                        "filter": None,
+                        "function": "is_not_null",
+                        "run_time": RUN_TIME,
+                        "run_id": RUN_ID,
+                        "user_metadata": {},
+                    }
+                ],
+                None,
+            ],
+        ],
+        schema=expected_schema,
+    )
+    expected_quarantine_df2 = spark.createDataFrame(
+        [
+            [
+                200,
+                None,
+                [
+                    {
+                        "name": "b_is_null",
+                        "message": "Column 'b' value is null",
+                        "columns": ["b"],
+                        "filter": None,
+                        "function": "is_not_null",
+                        "run_time": RUN_TIME,
+                        "run_id": RUN_ID,
+                        "user_metadata": {},
+                    }
+                ],
+                None,
+            ],
+        ],
+        schema=expected_schema,
+    )
+
+    assert_df_equality(spark.table(quarantine_tables[0]), expected_quarantine_df1, ignore_nullable=True)
+    assert_df_equality(spark.table(quarantine_tables[1]), expected_quarantine_df2, ignore_nullable=True)
+
+    for output_table in output_tables:
+        assert (
+            spark.sql(f"SHOW TABLES FROM {catalog_name}.{schema.name} LIKE '{output_table.split('.')[-1]}'").count()
+            == 0
+        ), f"Output table {output_table} should not have been created"
+
+
+@pytest.mark.usefixtures("skip_if_classic_compute")
+def test_apply_checks_and_save_in_tables_for_patterns_metrics_only_without_output_suffix(
+    ws, spark, make_schema, make_random, make_directory
+):
+    catalog_name = TEST_CATALOG
+    schema = make_schema(catalog_name=catalog_name)
+
+    input_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
+    metrics_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
+
+    test_schema = "a: int, b: string"
+    test_df1 = spark.createDataFrame([[1, "valid"], [None, "invalid"]], test_schema)
+    test_df2 = spark.createDataFrame([[100, "test"], [200, None]], test_schema)
+
+    test_df1.write.format("delta").mode("overwrite").saveAsTable(input_tables[0])
+    test_df2.write.format("delta").mode("overwrite").saveAsTable(input_tables[1])
+
+    table1_checks = [
+        {
+            "name": "a_is_null",
+            "criticality": "error",
+            "check": {"function": "is_not_null", "arguments": {"column": "a"}},
+        }
+    ]
+    table2_checks = [
+        {
+            "name": "b_is_null",
+            "criticality": "warn",
+            "check": {"function": "is_not_null", "arguments": {"column": "b"}},
+        }
+    ]
+
+    engine = DQEngine(ws, spark=spark, observer=DQMetricsObserver(), extra_params=EXTRA_PARAMS)
+    workspace_folder = str(make_directory().absolute())
+    engine.save_checks(
+        table1_checks, config=WorkspaceFileChecksStorageConfig(location=f"{workspace_folder}/{input_tables[0]}.yml")
+    )
+    engine.save_checks(
+        table2_checks, config=WorkspaceFileChecksStorageConfig(location=f"{workspace_folder}/{input_tables[1]}.yml")
+    )
+
+    engine.apply_checks_and_save_in_tables_for_patterns(
+        patterns=input_tables,
+        checks_location=workspace_folder,
+        run_config_template=RunConfig(metrics_config=OutputConfig(location=metrics_table)),
+        output_table_suffix="",
+        max_parallelism=1,
+    )
+
+    metrics_rows = spark.table(metrics_table).collect()
+    input_locations = {row["input_location"] for row in metrics_rows}
+    assert input_locations == set(input_tables)
+
+    metric_names = {row["metric_name"] for row in metrics_rows}
+    assert metric_names == {
+        "input_row_count",
+        "error_row_count",
+        "warning_row_count",
+        "valid_row_count",
+        "check_metrics",
+    }
+
+    output_locations = {row["output_location"] for row in metrics_rows}
+    assert output_locations == {None}
+
+    quarantine_locations = {row["quarantine_location"] for row in metrics_rows}
+    assert quarantine_locations == {None}
+
+
 def test_apply_checks_and_save_in_tables_for_patterns_checks_in_table(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
 
     # Create multiple input and output tables
-    input_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
+    input_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
     output_tables = [f"{table}_dq_output" for table in input_tables]
 
     # Create test data for both tables
@@ -1510,7 +1809,7 @@ def test_apply_checks_and_save_in_tables_for_patterns_checks_in_table(ws, spark,
     # Save the checks to workspace files:
     engine = DQEngine(ws, spark=spark, extra_params=EXTRA_PARAMS)
 
-    checks_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    checks_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     engine.save_checks(
         table1_checks, config=TableChecksStorageConfig(location=checks_table, run_config_name=input_tables[0])
     )
@@ -1588,7 +1887,7 @@ def test_apply_checks_and_save_in_tables_for_patterns_with_quarantine(
     schema = make_schema(catalog_name=catalog_name)
 
     # Create multiple input and output tables
-    input_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
+    input_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
     output_tables = [f"{table}_dq_output" for table in input_tables]
     quarantine_tables = [f"{table}_dq_quarantine" for table in input_tables]
 
@@ -1631,7 +1930,9 @@ def test_apply_checks_and_save_in_tables_for_patterns_with_quarantine(
         patterns=[f"{catalog_name}.{schema.name}.*"],
         checks_location=workspace_folder,
         max_parallelism=2,
-        run_config_template=RunConfig(quarantine_config=OutputConfig(location="")),
+        run_config_template=RunConfig(
+            output_config=OutputConfig(location=""), quarantine_config=OutputConfig(location="")
+        ),
     )
 
     # Verify both tables were created and contain the expected data
@@ -1713,7 +2014,7 @@ def test_apply_checks_and_save_in_tables_for_patterns_with_exclude_patterns(
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
 
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     test_schema = "a: int, b: string"
     test_df = spark.createDataFrame([[1, "valid"], [None, "invalid"]], test_schema)
     test_df.write.format("delta").mode("overwrite").saveAsTable(input_table)
@@ -1758,7 +2059,9 @@ def test_apply_checks_and_save_in_tables_for_patterns_with_exclude_patterns(
         exclude_patterns=[f"*{output_table_suffix}", f"*{quarantine_table_suffix}"],
         checks_location=workspace_folder + "/checks.yml",  # should strip the file name automatically,
         max_parallelism=2,
-        run_config_template=RunConfig(quarantine_config=OutputConfig(location="")),
+        run_config_template=RunConfig(
+            output_config=OutputConfig(location=""), quarantine_config=OutputConfig(location="")
+        ),
         output_table_suffix=output_table_suffix,
         quarantine_table_suffix=quarantine_table_suffix,
     )
@@ -1845,7 +2148,7 @@ def test_apply_checks_and_save_in_tables_for_patterns_with_custom_suffix(
     # Create multiple input and output tables
     output_table_suffix = "_dq_output_custom"
     quarantine_table_suffix = "_dq_quarantine_custom"
-    input_tables = [f"{catalog_name}.{schema.name}.{make_random(8).lower()}" for _ in range(2)]
+    input_tables = [f"{catalog_name}.{schema.name}.t{make_random(8).lower()}" for _ in range(2)]
     output_tables = [f"{table}{output_table_suffix}" for table in input_tables]
     quarantine_tables = [f"{table}{quarantine_table_suffix}" for table in input_tables]
 
@@ -1983,7 +2286,7 @@ def test_apply_checks_and_save_in_tables_with_patterns_and_custom_functions(
 ):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     output_table = f"{input_table}_dq_output"
 
     test_schema = "a: int, b: string"
@@ -2056,7 +2359,7 @@ def custom_string_check(column: str) -> Column:
 def test_apply_checks_and_save_in_tables_with_patterns_and_ref_df(ws, spark, make_schema, make_random, make_directory):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(8).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(8).lower()}"
     output_table = f"{input_table}_dq_output"
 
     test_schema = "a: int, b: string"
@@ -2102,9 +2405,9 @@ def test_apply_checks_and_save_in_tables_with_patterns_and_ref_df(ws, spark, mak
 def test_apply_checks_and_save_in_table_loads_checks_from_table(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(10).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(10).lower()}"
-    checks_table = f"{catalog_name}.{schema.name}.{make_random(10).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(10).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(10).lower()}"
+    checks_table = f"{catalog_name}.{schema.name}.t{make_random(10).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int, c: string"
@@ -2185,9 +2488,9 @@ def test_apply_checks_and_save_in_table_loads_checks_from_table(ws, spark, make_
 def test_apply_checks_by_metadata_and_save_in_table_loads_checks_from_table(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    input_table = f"{catalog_name}.{schema.name}.{make_random(10).lower()}"
-    output_table = f"{catalog_name}.{schema.name}.{make_random(10).lower()}"
-    checks_table = f"{catalog_name}.{schema.name}.{make_random(10).lower()}"
+    input_table = f"{catalog_name}.{schema.name}.t{make_random(10).lower()}"
+    output_table = f"{catalog_name}.{schema.name}.t{make_random(10).lower()}"
+    checks_table = f"{catalog_name}.{schema.name}.t{make_random(10).lower()}"
 
     # Create test data and save to source table
     test_schema = "a: int, b: int, c: string"

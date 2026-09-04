@@ -1,12 +1,15 @@
 from collections.abc import Callable
 import operator as py_operator
 import uuid
+from typing import Literal
 
 from pyspark.sql import Column, DataFrame
 import pyspark.sql.functions as F
 
-from databricks.labs.dqx.rule import register_rule
+from databricks.labs.dqx.rule import register_rule, requires_dbr_version
 from databricks.labs.dqx.check_funcs import make_condition, get_normalized_column_and_expr, get_limit_expr
+from databricks.labs.dqx.errors import InvalidParameterError
+from databricks.labs.dqx.utils import safe_filter_expr
 
 POINT_TYPE = "ST_Point"
 LINESTRING_TYPE = "ST_LineString"
@@ -16,6 +19,44 @@ MULTILINESTRING_TYPE = "ST_MultiLineString"
 MULTIPOLYGON_TYPE = "ST_MultiPolygon"
 GEOMETRYCOLLECTION_TYPE = "ST_GeometryCollection"
 DEFAULT_SRID = 4326
+
+_PRECISE_TOPOLOGICAL_RELATIONSHIPS = frozenset({"CONTAINS", "COVERS", "INTERSECTS", "TOUCHES", "WITHIN"})
+
+_PRECISE_TOPOLOGICAL_FUNCS: dict[str, str] = {
+    "WITHIN": "st_within",
+    "CONTAINS": "st_contains",
+    "COVERS": "st_covers",
+    "INTERSECTS": "st_intersects",
+    "TOUCHES": "st_touches",
+}
+
+_APPROXIMATE_TOPOLOGICAL_RELATIONSHIPS = frozenset({"COVERS", "INTERSECTS"})
+
+_PRECISE_ALIAS_SUFFIX = {
+    "CONTAINS": "is_not_in_reference_geometry",
+    "COVERS": "is_not_covered_by_reference_geometry_precisely",
+    "INTERSECTS": "does_not_intersect_reference_geometry_precisely",
+    "TOUCHES": "does_not_touch_reference_geometry",
+    "WITHIN": "does_not_contain_reference_geometry",
+}
+
+_PRECISE_MESSAGE_SUFFIX = {
+    "CONTAINS": "is not in the reference geometry",
+    "COVERS": "is not covered by the reference geometry precisely",
+    "INTERSECTS": "does not intersect the reference geometry precisely",
+    "TOUCHES": "does not touch the reference geometry",
+    "WITHIN": "does not contain reference geometry",
+}
+
+_APPROXIMATE_ALIAS_SUFFIX = {
+    "COVERS": "is_not_covered_by_reference_geometry_approximately",
+    "INTERSECTS": "does_not_intersect_reference_geometry_approximately",
+}
+
+_APPROXIMATE_MESSAGE_SUFFIX = {
+    "COVERS": "is not covered by the reference geometry approximately",
+    "INTERSECTS": "does not approximately intersect the reference geometry",
+}
 
 
 @register_rule("row")
@@ -64,6 +105,7 @@ def is_longitude(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_geometry(column: str | Column) -> Column:
     """Checks whether the values in the input column are valid geometries.
@@ -91,6 +133,7 @@ def is_geometry(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_geography(column: str | Column) -> Column:
     """Checks whether the values in the input column are valid geographies.
@@ -118,6 +161,7 @@ def is_geography(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_point(column: str | Column) -> Column:
     """Checks whether the values in the input column are point geometries.
@@ -145,6 +189,7 @@ def is_point(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_linestring(column: str | Column) -> Column:
     """Checks whether the values in the input column are linestring geometries.
@@ -172,6 +217,7 @@ def is_linestring(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_polygon(column: str | Column) -> Column:
     """Checks whether the values in the input column are polygon geometries.
@@ -199,6 +245,7 @@ def is_polygon(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_multipoint(column: str | Column) -> Column:
     """Checks whether the values in the input column are multipoint geometries.
@@ -226,6 +273,7 @@ def is_multipoint(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_multilinestring(column: str | Column) -> Column:
     """Checks whether the values in the input column are multilinestring geometries.
@@ -253,6 +301,7 @@ def is_multilinestring(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_multipolygon(column: str | Column) -> Column:
     """Checks whether the values in the input column are multipolygon geometries.
@@ -280,6 +329,7 @@ def is_multipolygon(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_geometrycollection(column: str | Column) -> Column:
     """Checks whether the values in the input column are geometrycollection geometries.
@@ -307,6 +357,7 @@ def is_geometrycollection(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_ogc_valid(column: str | Column) -> Column:
     """Checks whether the values in the input column are valid geometries in the OGC sense.
@@ -335,6 +386,7 @@ def is_ogc_valid(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_non_empty_geometry(column: str | Column) -> Column:
     """Checks whether the values in the input column are empty geometries.
@@ -363,6 +415,7 @@ def is_non_empty_geometry(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_not_null_island(column: str | Column) -> Column:
     """Checks whether the values in the input column are NULL island geometries (e.g. POINT(0 0), POINTZ(0 0 0), or
@@ -399,6 +452,7 @@ def is_not_null_island(column: str | Column) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def has_dimension(column: str | Column, dimension: int) -> Column:
     """Checks whether the geometries/geographies in the input column have a given dimension.
@@ -428,6 +482,7 @@ def has_dimension(column: str | Column, dimension: int) -> Column:
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def has_x_coordinate_between(column: str | Column, min_value: float, max_value: float) -> Column:
     """Checks whether the x coordinates of the geometries in the input column are between a given range.
@@ -460,6 +515,7 @@ def has_x_coordinate_between(column: str | Column, min_value: float, max_value: 
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def has_y_coordinate_between(column: str | Column, min_value: float, max_value: float) -> Column:
     """Checks whether the y coordinates of the geometries in the input column are between a given range.
@@ -492,6 +548,7 @@ def has_y_coordinate_between(column: str | Column, min_value: float, max_value: 
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_area_equal_to(
     column: str | Column, value: int | float | str | Column, srid: int | None = 3857, geodesic: bool = False
@@ -529,6 +586,7 @@ def is_area_equal_to(
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_area_not_equal_to(
     column: str | Column, value: int | float | str | Column, srid: int | None = 3857, geodesic: bool = False
@@ -566,6 +624,7 @@ def is_area_not_equal_to(
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_area_not_greater_than(
     column: str | Column, value: int | float | str | Column, srid: int | None = 3857, geodesic: bool = False
@@ -603,6 +662,7 @@ def is_area_not_greater_than(
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_area_not_less_than(
     column: str | Column, value: int | float | str | Column, srid: int | None = 3857, geodesic: bool = False
@@ -640,6 +700,7 @@ def is_area_not_less_than(
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_num_points_equal_to(column: str | Column, value: int | float | str | Column) -> Column:
     """
@@ -668,6 +729,7 @@ def is_num_points_equal_to(column: str | Column, value: int | float | str | Colu
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_num_points_not_equal_to(column: str | Column, value: int | float | str | Column) -> Column:
     """
@@ -696,6 +758,7 @@ def is_num_points_not_equal_to(column: str | Column, value: int | float | str | 
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_num_points_not_greater_than(column: str | Column, value: int | float | str | Column) -> Column:
     """
@@ -724,6 +787,7 @@ def is_num_points_not_greater_than(column: str | Column, value: int | float | st
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("row")
 def is_num_points_not_less_than(column: str | Column, value: int | float | str | Column) -> Column:
     """
@@ -824,6 +888,7 @@ def _compare_spatial_sql_function_result(
     )
 
 
+@requires_dbr_version("17.1")
 @register_rule("dataset")
 def are_polygons_mutually_disjoint(
     column: str | Column,
@@ -875,7 +940,7 @@ def are_polygons_mutually_disjoint(
         df_with_hash = df.withColumn(row_id_col, F.xxhash64(F.struct("*")))
 
         # Apply filter after hashing (so hash is available for final join to preserve all rows)
-        filtered_df = df_with_hash.filter(F.expr(row_filter)) if row_filter is not None else df_with_hash
+        filtered_df = df_with_hash.filter(safe_filter_expr(row_filter)) if row_filter is not None else df_with_hash
 
         duplicates_df = filtered_df.groupBy(row_id_col).count().filter("count > 1").select(row_id_col)
 
@@ -918,3 +983,360 @@ def are_polygons_mutually_disjoint(
     )
 
     return condition, apply
+
+
+def _has_topological_relationship_precise(
+    column: str | Column,
+    reference_geometry: str | bytes | Column,
+    convert_column: bool = False,
+    convert_reference_geometry: bool = False,
+    topological_relationship: Literal["CONTAINS", "COVERS", "INTERSECTS", "TOUCHES", "WITHIN"] = "CONTAINS",
+) -> Column:
+    if topological_relationship not in _PRECISE_TOPOLOGICAL_RELATIONSHIPS:
+        raise InvalidParameterError(
+            f"'topological_relationship' must be one of {sorted(_PRECISE_TOPOLOGICAL_RELATIONSHIPS)}, got '{topological_relationship}'."
+        )
+
+    col_str_norm, col_expr_str, col_expr = get_normalized_column_and_expr(column)
+
+    col_geom = F.call_function("try_to_geometry", col_expr) if convert_column else col_expr
+    ref_col = reference_geometry if isinstance(reference_geometry, Column) else F.lit(reference_geometry)
+    ref_geom = F.call_function("try_to_geometry", ref_col) if convert_reference_geometry else ref_col
+
+    has_relationship = F.call_function(_PRECISE_TOPOLOGICAL_FUNCS[topological_relationship], ref_geom, col_geom)
+    condition = F.when(col_expr.isNull(), F.lit(None)).otherwise(~has_relationship)
+    text_value_col = F.call_function("st_astext", F.call_function("try_to_geometry", col_expr))
+
+    alias_suffix = _PRECISE_ALIAS_SUFFIX[topological_relationship]
+    alias = f'{col_str_norm}_{alias_suffix}'
+
+    message_suffix = _PRECISE_MESSAGE_SUFFIX[topological_relationship]
+
+    return make_condition(
+        condition,
+        F.concat_ws(
+            "",
+            F.lit("value `"),
+            text_value_col,
+            F.lit(f"` in column `{col_expr_str}` {message_suffix}"),
+        ),
+        alias=alias,
+    )
+
+
+def _has_topological_relationship_approximate(
+    column: str | Column,
+    reference_geometry: str | Column,
+    resolution: int | Column,
+    topological_relationship: Literal["COVERS", "INTERSECTS"] = "COVERS",
+) -> Column:
+    if not (isinstance(resolution, Column) or (isinstance(resolution, int) and 0 <= resolution <= 15)):
+        raise InvalidParameterError("'resolution' must be between 0 and 15.")
+
+    if topological_relationship not in _APPROXIMATE_TOPOLOGICAL_RELATIONSHIPS:
+        raise InvalidParameterError(
+            f"'topological_relationship' must be one of {sorted(_APPROXIMATE_TOPOLOGICAL_RELATIONSHIPS)}, got '{topological_relationship}'."
+        )
+
+    col_str_norm, col_expr_str, col_expr = get_normalized_column_and_expr(column)
+    ref_col = reference_geometry if isinstance(reference_geometry, Column) else F.lit(reference_geometry)
+    resolution_col = resolution if isinstance(resolution, Column) else F.lit(resolution)
+
+    def _h3_cells(geom_expr: Column) -> Column:
+        # `h3_try_coverash3` returns NULL for point geometries (no areal coverage) and for
+        # invalid/unsupported input. For points we fall back to `h3_pointash3`, but that is the
+        # non-`try` variant and raises on non-point/invalid input, so gate it on the value actually
+        # parsing to a point. `coalesce` and `when` both short-circuit, so `h3_pointash3` only runs on
+        # a confirmed point; invalid geometries yield NULL and are skipped instead of failing the job.
+        cover = F.call_function("h3_try_coverash3", geom_expr, resolution_col)
+        is_point_geom = F.call_function("st_geometrytype", F.call_function("try_to_geometry", geom_expr)) == F.lit(
+            POINT_TYPE
+        )
+        point_cell = F.when(is_point_geom, F.array(F.call_function("h3_pointash3", geom_expr, resolution_col)))
+        return F.array_distinct(F.coalesce(cover, point_cell))
+
+    col_h3_array = _h3_cells(col_expr)
+    ref_h3_array = _h3_cells(ref_col)
+    intersection_size = F.size(F.array_intersect(col_h3_array, ref_h3_array))
+
+    is_inside = None
+    match topological_relationship:
+        case "INTERSECTS":
+            is_inside = intersection_size > 0
+        case "COVERS":
+            is_inside = intersection_size == F.size(col_h3_array)
+        case _:
+            raise InvalidParameterError(f"Unsupported approximate relationship: {topological_relationship!r}")
+
+    condition = F.when(col_expr.isNull() | col_h3_array.isNull(), F.lit(None)).otherwise(~is_inside)
+
+    text_value_col = F.call_function("st_astext", F.call_function("try_to_geometry", col_expr))
+
+    alias_suffix = _APPROXIMATE_ALIAS_SUFFIX[topological_relationship]
+    alias = f'{col_str_norm}_{alias_suffix}'
+
+    message_suffix = _APPROXIMATE_MESSAGE_SUFFIX[topological_relationship]
+
+    return make_condition(
+        condition,
+        F.concat_ws(
+            "",
+            F.lit("value `"),
+            text_value_col,
+            F.lit(f"` in column `{col_expr_str}` {message_suffix}"),
+        ),
+        alias=alias,
+    )
+
+
+@requires_dbr_version("17.1")
+@register_rule("row")
+def is_geo_contains(
+    column: str | Column,
+    reference_geometry: str | bytes | Column,
+    convert_column: bool = False,
+    convert_reference_geometry: bool = False,
+) -> Column:
+    """Checks if the reference geometry contains the column geometry using `st_contains` with meter-level precision.
+
+    A geometry A *contains* geometry B when B lies entirely within the interior of A, with no boundary
+    points of B lying on the boundary of A. Points on the shared boundary are not considered contained;
+    use *is_geo_covers* for boundary-inclusive coverage checks.
+
+    Both the target column and the reference geometry are always handled as `GEOMETRY`.
+    When conversion is requested (*convert_column* or *convert_reference_geometry* set to True),
+    *try_to_geometry* is applied to parse the value from any supported format (WKT, WKB, EWKT, EWKB).
+    See https://docs.databricks.com/aws/en/sql/language-manual/functions/try_to_geometry for details.
+    When conversion is not requested, the input is assumed to already hold a native `GEOMETRY` value.
+
+    Args:
+        column: Column to check. Null values are skipped for validation.
+        reference_geometry: Reference geometry as a literal WKT/WKB/EWKT/EWKB string or bytes value,
+            or a Column expression (e.g. *F.col('col_name')*) to reference another column. A plain
+            string is always treated as a literal, not a column name.
+        convert_column: When True, *try_to_geometry* is applied to convert the column values to GEOMETRY.
+            When False (default), the column is assumed to already hold a native GEOMETRY value.
+        convert_reference_geometry: When True, *try_to_geometry* is applied to convert the reference
+            geometry to GEOMETRY. When False (default), the reference geometry is assumed to already
+            hold a native GEOMETRY value.
+
+    Returns:
+        Column object indicating whether values in the input column are not contained by the reference
+        geometry.
+
+    Note:
+        This function requires Databricks serverless compute or runtime 17.1 or above.
+    """
+    return _has_topological_relationship_precise(
+        column, reference_geometry, convert_column, convert_reference_geometry, "CONTAINS"
+    )
+
+
+@requires_dbr_version("17.1")
+@register_rule("row")
+def is_geo_covers(
+    column: str | Column,
+    reference_geometry: str | bytes | Column,
+    precise: bool = False,
+    resolution: int | Column | None = None,
+    convert_column: bool = False,
+    convert_reference_geometry: bool = False,
+) -> Column:
+    """Checks if the reference geometry covers the column geometry.
+
+    When *precise* is True, uses `st_covers` for exact computation with meter-level precision.
+    A geometry A *covers* geometry B when every point of B lies within A, including boundary points.
+    This differs from `st_contains`, which excludes points on A's boundary.
+
+    When *precise* is False (default), approximates coverage using H3 cell indexing: all hexagonal
+    cells that represent the column geometry must also be present in the H3 cells of the reference
+    geometry. Higher *resolution* values give finer precision at the cost of more cells. Because H3
+    cells are discrete approximations, boundary behaviour differs from the exact `st_covers` predicate
+    and geometries near the boundary may be misclassified.
+
+    Both the target column and the reference geometry are always handled as `GEOMETRY` in precise mode.
+    When conversion is requested (*convert_column* or *convert_reference_geometry* set to True),
+    *try_to_geometry* is applied. These flags are ignored in approximate mode, where null and invalid
+    (unparseable) geometries are skipped rather than flagged — use *is_geometry* to flag invalid values.
+
+    Args:
+        column: Column to check. Null values are skipped for validation.
+        reference_geometry: Reference geometry as a literal WKT/WKB/EWKT/EWKB string or bytes value,
+            or a Column expression (e.g. *F.col('col_name')*) to reference another column. A plain
+            string is always treated as a literal, not a column name. Bytes (WKB) are only supported
+            in precise mode.
+        precise: When True, uses exact `st_covers` computation. When False (default), uses the H3
+            approximate method which requires *resolution*.
+        resolution: H3 resolution integer (0–15) or column reference. Required when *precise* is False.
+            Higher values give finer precision at the cost of more cells.
+        convert_column: When True, *try_to_geometry* is applied to convert column values to GEOMETRY.
+            Only used in precise mode.
+        convert_reference_geometry: When True, *try_to_geometry* is applied to convert the reference
+            geometry to GEOMETRY. Only used in precise mode.
+
+    Returns:
+        Column object indicating whether values in the input column are not covered by the reference
+        geometry.
+
+    Raises:
+        InvalidParameterError: If *precise* is False and *resolution* is not provided or is outside 0–15.
+
+    Note:
+        This function requires Databricks serverless compute or runtime 17.1 or above if `precise` is True.
+    """
+    if precise:
+        return _has_topological_relationship_precise(
+            column, reference_geometry, convert_column, convert_reference_geometry, "COVERS"
+        )
+    if resolution is None:
+        raise InvalidParameterError("'resolution' is required when 'precise' is False.")
+    if isinstance(reference_geometry, bytes):
+        raise InvalidParameterError("Bytes (WKB) reference geometry is only supported in precise mode.")
+    return _has_topological_relationship_approximate(column, reference_geometry, resolution, "COVERS")
+
+
+@requires_dbr_version("17.1")
+@register_rule("row")
+def is_geo_intersects(
+    column: str | Column,
+    reference_geometry: str | bytes | Column,
+    precise: bool = False,
+    resolution: int | Column | None = None,
+    convert_column: bool = False,
+    convert_reference_geometry: bool = False,
+) -> Column:
+    """Checks if the column geometry intersects the reference geometry.
+
+    When *precise* is True, uses `st_intersects` for exact computation with meter-level precision.
+    Two geometries intersect when they share at least one point, whether interior or boundary.
+
+    When *precise* is False (default), approximates intersection using H3 cell indexing: at least one
+    hexagonal cell must be shared between the H3 representations of the column and reference geometries.
+    Higher *resolution* values give finer precision at the cost of more cells. Because H3 cells are
+    discrete approximations, boundary behaviour differs from the exact `st_intersects` predicate.
+
+    Both the target column and the reference geometry are always handled as `GEOMETRY` in precise mode.
+    When conversion is requested (*convert_column* or *convert_reference_geometry* set to True),
+    *try_to_geometry* is applied. These flags are ignored in approximate mode, where null and invalid
+    (unparseable) geometries are skipped rather than flagged — use *is_geometry* to flag invalid values.
+
+    Args:
+        column: Column to check. Null values are skipped for validation.
+        reference_geometry: Reference geometry as a literal WKT/WKB/EWKT/EWKB string or bytes value,
+            or a Column expression (e.g. *F.col('col_name')*) to reference another column. A plain
+            string is always treated as a literal, not a column name. Bytes (WKB) are only supported
+            in precise mode.
+        precise: When True, uses exact `st_intersects` computation. When False (default), uses the H3
+            approximate method which requires *resolution*.
+        resolution: H3 resolution integer (0–15) or column reference. Required when *precise* is False.
+            Higher values give finer precision at the cost of more cells.
+        convert_column: When True, *try_to_geometry* is applied to convert column values to GEOMETRY.
+            Only used in precise mode.
+        convert_reference_geometry: When True, *try_to_geometry* is applied to convert the reference
+            geometry to GEOMETRY. Only used in precise mode.
+
+    Returns:
+        Column object indicating whether values in the input column do not intersect the reference
+        geometry.
+
+    Raises:
+        InvalidParameterError: If *precise* is False and *resolution* is not provided or is outside 0–15.
+
+    Note:
+        This function requires Databricks serverless compute or runtime 17.1 or above if `precise` is True.
+    """
+    if precise:
+        return _has_topological_relationship_precise(
+            column, reference_geometry, convert_column, convert_reference_geometry, "INTERSECTS"
+        )
+    if resolution is None:
+        raise InvalidParameterError("'resolution' is required when 'precise' is False.")
+    if isinstance(reference_geometry, bytes):
+        raise InvalidParameterError("Bytes (WKB) reference geometry is only supported in precise mode.")
+    return _has_topological_relationship_approximate(column, reference_geometry, resolution, "INTERSECTS")
+
+
+@requires_dbr_version("17.1")
+@register_rule("row")
+def is_geo_touches(
+    column: str | Column,
+    reference_geometry: str | bytes | Column,
+    convert_column: bool = False,
+    convert_reference_geometry: bool = False,
+) -> Column:
+    """Checks if the column geometry touches the reference geometry using `st_touches` with meter-level precision.
+
+    Two geometries *touch* when they share at least one boundary point but their interiors do not
+    intersect. A point strictly inside a polygon does not touch it; a point on the polygon boundary
+    does.
+
+    Both the target column and the reference geometry are always handled as `GEOMETRY`.
+    When conversion is requested (*convert_column* or *convert_reference_geometry* set to True),
+    *try_to_geometry* is applied to parse the value from any supported format (WKT, WKB, EWKT, EWKB).
+    When conversion is not requested, the input is assumed to already hold a native `GEOMETRY` value.
+
+    Args:
+        column: Column to check. Null values are skipped for validation.
+        reference_geometry: Reference geometry as a literal WKT/WKB/EWKT/EWKB string or bytes value,
+            or a Column expression (e.g. *F.col('col_name')*) to reference another column. A plain
+            string is always treated as a literal, not a column name.
+        convert_column: When True, *try_to_geometry* is applied to convert column values to GEOMETRY.
+            When False (default), the column is assumed to already hold a native GEOMETRY value.
+        convert_reference_geometry: When True, *try_to_geometry* is applied to convert the reference
+            geometry to GEOMETRY. When False (default), the reference geometry is assumed to already
+            hold a native GEOMETRY value.
+
+    Returns:
+        Column object indicating whether values in the input column do not touch the reference geometry.
+
+    Note:
+        This function requires Databricks serverless compute or runtime 17.1 or above.
+    """
+    return _has_topological_relationship_precise(
+        column, reference_geometry, convert_column, convert_reference_geometry, "TOUCHES"
+    )
+
+
+@requires_dbr_version("17.1")
+@register_rule("row")
+def is_geo_within(
+    column: str | Column,
+    reference_geometry: str | bytes | Column,
+    convert_column: bool = False,
+    convert_reference_geometry: bool = False,
+) -> Column:
+    """Checks if the reference geometry is within the column geometry using `st_within` with meter-level precision.
+
+    *NOTE*: the column geometry is the OUTER container in this check; the reference is the inner test geometry.
+    Contrast with is_geo_contains where the reference is the outer container.
+
+    `st_within(reference, column)` returns true when the reference geometry lies entirely within the
+    column geometry. This is the converse of `st_contains`: the column geometry must contain the
+    reference, with the reference's boundary and interior both lying inside the column's interior.
+
+    Both the target column and the reference geometry are always handled as `GEOMETRY`.
+    When conversion is requested (*convert_column* or *convert_reference_geometry* set to True),
+    *try_to_geometry* is applied to parse the value from any supported format (WKT, WKB, EWKT, EWKB).
+    When conversion is not requested, the input is assumed to already hold a native `GEOMETRY` value.
+
+    Args:
+        column: Column to check. Null values are skipped for validation.
+        reference_geometry: Reference geometry as a literal WKT/WKB/EWKT/EWKB string or bytes value,
+            or a Column expression (e.g. *F.col('col_name')*) to reference another column. A plain
+            string is always treated as a literal, not a column name.
+        convert_column: When True, *try_to_geometry* is applied to convert column values to GEOMETRY.
+            When False (default), the column is assumed to already hold a native GEOMETRY value.
+        convert_reference_geometry: When True, *try_to_geometry* is applied to convert the reference
+            geometry to GEOMETRY. When False (default), the reference geometry is assumed to already
+            hold a native GEOMETRY value.
+
+    Returns:
+        Column object indicating whether the reference geometry is not within the values in the input
+        column.
+
+    Note:
+        This function requires Databricks serverless compute or runtime 17.1 or above.
+    """
+    return _has_topological_relationship_precise(
+        column, reference_geometry, convert_column, convert_reference_geometry, "WITHIN"
+    )

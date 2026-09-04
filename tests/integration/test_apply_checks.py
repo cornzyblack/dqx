@@ -28,6 +28,7 @@ from tests.integration.conftest import (
     EXTRA_PARAMS,
     RUN_ID,
     build_quality_violation,
+    build_skipped_violation,
     assert_check_and_split_results,
     assert_df_equality_ignore_fingerprints as assert_df_equality,
     generate_checks_with_rule_and_set_fingerprint_from_rules,
@@ -66,6 +67,78 @@ def test_apply_checks_and_split_on_empty_checks(ws, spark):
     assert_df_equality(bad, expected_df)
 
 
+def test_apply_checks_with_mixed_type_user_metadata(ws, spark):
+    # Regression: user_metadata with mixed value types (str + int) must materialize without a
+    # CAST_INVALID_INPUT error. The result column is MAP<STRING, STRING>, so values are stringified.
+    dq_engine = DQEngine(ws)
+    test_df = spark.createDataFrame([[None, 1, 1]], SCHEMA)
+
+    checks = [
+        DQRowRule(
+            name="a_is_null",
+            criticality="error",
+            check_func=check_funcs.is_not_null,
+            column="a",
+            user_metadata={"key1": "value1", "key2": 2},
+        )
+    ]
+
+    checked = dq_engine.apply_checks(test_df, checks)
+    # Materializing the result must not raise; the numeric value is stored as its string form.
+    row = checked.collect()[0]
+    metadata = row["_errors"][0]["user_metadata"]
+    assert metadata == {"key1": "value1", "key2": "2"}
+
+
+def test_apply_checks_and_split_has_no_gaps_per_time_window(ws, spark, set_utc_timezone):
+    dq_engine = DQEngine(workspace_client=ws, extra_params=EXTRA_PARAMS)
+    schema = "event_ts timestamp, val int"
+    test_df = spark.createDataFrame(
+        [
+            (datetime(2025, 7, 14), 1),  # 2025-07-15 missing -> gap, boundary row is quarantined
+            (datetime(2025, 7, 16), 2),  # consecutive with 2025-07-17 -> valid
+            (datetime(2025, 7, 17), 3),  # valid
+        ],
+        schema,
+    )
+    checks = [
+        DQDatasetRule(
+            criticality="error",
+            check_func=check_funcs.has_no_gaps_per_time_window,
+            column="event_ts",
+            check_func_kwargs={"window_minutes": 1440},
+        ),
+    ]
+
+    checked = dq_engine.apply_checks(test_df, checks)
+    good, bad = dq_engine.apply_checks_and_split(test_df, checks)
+
+    expected_schema = schema + REPORTING_COLUMNS
+    expected = spark.createDataFrame(
+        [
+            [
+                datetime(2025, 7, 14),
+                1,
+                [
+                    build_quality_violation(
+                        "event_ts_has_no_gaps_per_time_window",
+                        "Gap in time series: no data between the window starting at 2025-07-14 00:00:00 "
+                        "and the next present window starting at 2025-07-16 00:00:00",
+                        ["event_ts"],
+                        function="has_no_gaps_per_time_window",
+                    ),
+                ],
+                None,
+            ],
+            [datetime(2025, 7, 16), 2, None, None],
+            [datetime(2025, 7, 17), 3, None, None],
+        ],
+        expected_schema,
+    )
+
+    assert_check_and_split_results(checked, good, bad, expected, ["event_ts", "val"])
+
+
 def test_apply_checks_passed(ws, spark):
     dq_engine = DQEngine(ws)
     test_df = spark.createDataFrame([[1, 3, 3]], SCHEMA)
@@ -94,7 +167,7 @@ def test_apply_checks_passed(ws, spark):
 def test_apply_checks_failed(ws, spark, make_schema, make_table, make_random):
     catalog = TEST_CATALOG
     schema = make_schema(catalog_name=catalog).name
-    output_table = f"{catalog}.{schema}.{make_random(8).lower()}"
+    output_table = f"{catalog}.{schema}.t{make_random(8).lower()}"
 
     dq_engine = DQEngine(ws)
     test_df = spark.createDataFrame([[1, 1, 1], [None, 1, 2], [1, None, 3]], SCHEMA)
@@ -830,7 +903,7 @@ def test_foreign_key_check_on_tables(ws, spark, make_schema, make_random):
 
     catalog_name = TEST_CATALOG
     schema = make_schema(catalog_name=catalog_name)
-    ref_table = f"{catalog_name}.{schema.name}.{make_random(10).lower()}"
+    ref_table = f"{catalog_name}.{schema.name}.t{make_random(10).lower()}"
     ref_df.write.saveAsTable(ref_table)
 
     ref_df2 = spark.createDataFrame(
@@ -843,7 +916,7 @@ def test_foreign_key_check_on_tables(ws, spark, make_schema, make_random):
         SCHEMA,
     )
 
-    ref_table2 = f"{catalog_name}.{schema.name}.{make_random(10).lower()}"
+    ref_table2 = f"{catalog_name}.{schema.name}.t{make_random(10).lower()}"
     ref_df2.write.saveAsTable(ref_table2)
 
     checks = [
@@ -3300,6 +3373,18 @@ def test_apply_checks_with_sql_query(ws, spark):
                         "run_id": RUN_ID,
                         "user_metadata": {},
                     },
+                    # null-safe merge on [b, c]: this row's key (b=NULL, c=3) now matches the query
+                    # group (b=NULL, c=3) because NULL<=>NULL is True on b (and 3==3 on c)
+                    {
+                        "name": "multiple_key_check_violation",
+                        "message": "multiple key check failed",
+                        "columns": None,
+                        "filter": None,
+                        "function": "sql_query",
+                        "run_time": RUN_TIME,
+                        "run_id": RUN_ID,
+                        "user_metadata": {},
+                    },
                 ],
             ],
             [
@@ -3335,6 +3420,18 @@ def test_apply_checks_with_sql_query(ws, spark):
                     {
                         "name": "non_unique_merge_key",
                         "message": f"Value is not matching query: '{query_non_unique_merge_key}'",
+                        "columns": None,
+                        "filter": None,
+                        "function": "sql_query",
+                        "run_time": RUN_TIME,
+                        "run_id": RUN_ID,
+                        "user_metadata": {},
+                    },
+                    # null-safe merge on [b, c]: this row's key (b=NULL, c=4) now matches the query
+                    # group (b=NULL, c=4) because NULL<=>NULL is True on b (and 4==4 on c)
+                    {
+                        "name": "multiple_key_check_violation",
+                        "message": "multiple key check failed",
                         "columns": None,
                         "filter": None,
                         "function": "sql_query",
@@ -5889,8 +5986,8 @@ def test_apply_checks_with_is_unique_nulls_not_distinct(ws, spark, set_utc_timez
 def test_apply_checks_all_row_checks_as_yaml_with_streaming(ws, make_schema, make_random, make_volume, spark):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    input_table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
-    output_table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    input_table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
+    output_table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
     volume = make_volume(catalog_name=catalog_name, schema_name=schema_name)
 
     file_path = Path(__file__).parent.parent / "resources" / "all_row_checks.yaml"
@@ -5903,7 +6000,9 @@ def test_apply_checks_all_row_checks_as_yaml_with_streaming(ws, make_schema, mak
     schema = (
         "col1: string, col2: int, col3: int, col4 array<int>, col5: date, col6: timestamp, "
         "col7: map<string, int>, col8: struct<field1: int>, col10: int, col11: string, "
-        "col_ipv4: string, col_ipv6: string, col_json_str: string, col_json_str2: string"
+        "col_ipv4: string, col_ipv6: string, col_json_str: string, col_json_str2: string, "
+        "col_email: string, col_uuid: string, col_ssn: string, col_country: string, col_currency: string, "
+        "col_subdivision: string, col_language: string, col_url: string"
     )
     test_df = spark.createDataFrame(
         [
@@ -5922,6 +6021,14 @@ def test_apply_checks_all_row_checks_as_yaml_with_streaming(ws, make_schema, mak
                 "2001:0db8:85a3:08d3:1319:8a2e:0370:7344",
                 '{"key1": "1"}',
                 '{"a" : 1, "b": 2}',
+                "user@example.com",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "123-45-6789",
+                "US",
+                "USD",
+                "US-CA",
+                "en",
+                "https://example.com/a",
             ],
             [
                 "val2",
@@ -5938,6 +6045,14 @@ def test_apply_checks_all_row_checks_as_yaml_with_streaming(ws, make_schema, mak
                 "2001:0db8:85a3:08d3:ffff:ffff:ffff:ffff",
                 '{"key1": "1", "key2": "2"}',
                 '{ "a" : 1, "b": 1000,  "c": {"1": 8}}',
+                '"quoted_user"@example.co.uk',
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "223-45-6789",
+                "GB",
+                "EUR",
+                "GB-ENG",
+                "en",
+                "https://sub.example.org/p?q=1",
             ],
             [
                 "val3",
@@ -5954,6 +6069,14 @@ def test_apply_checks_all_row_checks_as_yaml_with_streaming(ws, make_schema, mak
                 "2001:db8:85a3:8d3:1319:8a2e:3.112.115.68",
                 '{"key1": "[1, 2, 3]"}',
                 '{ "a" : 1, "b": 1023455,  "c": null }',
+                "user@[12.96.144.202]",
+                "12345678-1234-8234-9234-123456789abc",
+                "323-45-6789",
+                "DE",
+                "GBP",
+                "DE-BY",
+                "de",
+                "ftp://files.example.org/f.txt",
             ],
         ],
         schema,
@@ -5994,6 +6117,14 @@ def test_apply_checks_all_row_checks_as_yaml_with_streaming(ws, make_schema, mak
                 "2001:0db8:85a3:08d3:1319:8a2e:0370:7344",
                 '{"key1": "1"}',
                 '{"a" : 1, "b": 2}',
+                "user@example.com",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "123-45-6789",
+                "US",
+                "USD",
+                "US-CA",
+                "en",
+                "https://example.com/a",
                 None,
                 None,
             ],
@@ -6012,6 +6143,14 @@ def test_apply_checks_all_row_checks_as_yaml_with_streaming(ws, make_schema, mak
                 "2001:0db8:85a3:08d3:ffff:ffff:ffff:ffff",
                 '{"key1": "1", "key2": "2"}',
                 '{ "a" : 1, "b": 1000,  "c": {"1": 8}}',
+                '"quoted_user"@example.co.uk',
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "223-45-6789",
+                "GB",
+                "EUR",
+                "GB-ENG",
+                "en",
+                "https://sub.example.org/p?q=1",
                 None,
                 None,
             ],
@@ -6030,6 +6169,14 @@ def test_apply_checks_all_row_checks_as_yaml_with_streaming(ws, make_schema, mak
                 "2001:db8:85a3:8d3:1319:8a2e:3.112.115.68",
                 '{"key1": "[1, 2, 3]"}',
                 '{ "a" : 1, "b": 1023455,  "c": null }',
+                "user@[12.96.144.202]",
+                "12345678-1234-8234-9234-123456789abc",
+                "323-45-6789",
+                "DE",
+                "GBP",
+                "DE-BY",
+                "de",
+                "ftp://files.example.org/f.txt",
                 None,
                 None,
             ],
@@ -6045,8 +6192,8 @@ def test_apply_checks_all_row_geo_checks_as_yaml_with_streaming(
 ):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    input_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
-    output_table_name = f"{catalog_name}.{schema_name}.{make_random(6).lower()}"
+    input_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
+    output_table_name = f"{catalog_name}.{schema_name}.t{make_random(6).lower()}"
     volume = make_volume(catalog_name=catalog_name, schema_name=schema_name)
 
     file_path = Path(__file__).parent.parent / "resources" / "all_row_geo_checks.yaml"
@@ -6183,7 +6330,9 @@ def test_apply_checks_all_checks_as_yaml(ws, spark):
     schema = (
         "col1: string, col2: int, col3: int, col4 array<int>, col5: date, col6: timestamp, "
         "col7: map<string, int>, col8: struct<field1: int>, col10: int, col11: string, "
-        "col_ipv4: string, col_ipv6: string, col_json_str: string, col_json_str2: string"
+        "col_ipv4: string, col_ipv6: string, col_json_str: string, col_json_str2: string, "
+        "col_email: string, col_uuid: string, col_ssn: string, col_country: string, col_currency: string, "
+        "col_subdivision: string, col_language: string, col_url: string"
     )
     test_df = spark.createDataFrame(
         [
@@ -6202,6 +6351,14 @@ def test_apply_checks_all_checks_as_yaml(ws, spark):
                 "2001:0db8:85a3:08d3:0000:0000:0000:0001",
                 '{"key1": "1"}',
                 '{"a" : 1, "b": 2}',
+                "user@example.com",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "123-45-6789",
+                "US",
+                "USD",
+                "US-CA",
+                "en",
+                "https://example.com/a",
             ],
             [
                 "val2",
@@ -6218,6 +6375,14 @@ def test_apply_checks_all_checks_as_yaml(ws, spark):
                 "2001:0db8:85a3:08d3:0000:0000:0000:1",
                 '{"key1": "1", "key2": "2"}',
                 '{ "a" : 1, "b": 1000,  "c": {"1": 8}}',
+                '"quoted_user"@example.co.uk',
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "223-45-6789",
+                "GB",
+                "EUR",
+                "GB-ENG",
+                "en",
+                "https://sub.example.org/p?q=1",
             ],
             [
                 "val3",
@@ -6234,6 +6399,14 @@ def test_apply_checks_all_checks_as_yaml(ws, spark):
                 "2001:0db8:85a3:08d3:0000::2",
                 '{"key1": "[1, 2, 3]"}',
                 '{ "a" : 1, "b": 1023455,  "c": null }',
+                "user@[12.96.144.202]",
+                "12345678-1234-8234-9234-123456789abc",
+                "323-45-6789",
+                "DE",
+                "GBP",
+                "DE-BY",
+                "de",
+                "ftp://files.example.org/f.txt",
             ],
         ],
         schema,
@@ -6262,6 +6435,14 @@ def test_apply_checks_all_checks_as_yaml(ws, spark):
                 "2001:0db8:85a3:08d3:0000:0000:0000:0001",
                 '{"key1": "1"}',
                 '{"a" : 1, "b": 2}',
+                "user@example.com",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "123-45-6789",
+                "US",
+                "USD",
+                "US-CA",
+                "en",
+                "https://example.com/a",
                 None,
                 None,
             ],
@@ -6280,6 +6461,14 @@ def test_apply_checks_all_checks_as_yaml(ws, spark):
                 "2001:0db8:85a3:08d3:0000:0000:0000:1",
                 '{"key1": "1", "key2": "2"}',
                 '{ "a" : 1, "b": 1000,  "c": {"1": 8}}',
+                '"quoted_user"@example.co.uk',
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "223-45-6789",
+                "GB",
+                "EUR",
+                "GB-ENG",
+                "en",
+                "https://sub.example.org/p?q=1",
                 None,
                 None,
             ],
@@ -6298,6 +6487,14 @@ def test_apply_checks_all_checks_as_yaml(ws, spark):
                 "2001:0db8:85a3:08d3:0000::2",
                 '{"key1": "[1, 2, 3]"}',
                 '{ "a" : 1, "b": 1023455,  "c": null }',
+                "user@[12.96.144.202]",
+                "12345678-1234-8234-9234-123456789abc",
+                "323-45-6789",
+                "DE",
+                "GBP",
+                "DE-BY",
+                "de",
+                "ftp://files.example.org/f.txt",
                 None,
                 None,
             ],
@@ -7050,6 +7247,20 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
             column="col6",
             check_func_kwargs={"window_minutes": 1, "min_records_per_window": 1, "lookback_windows": 3},
         ),
+        # has_no_gaps_per_time_window check
+        DQDatasetRule(
+            criticality="error",
+            check_func=check_funcs.has_no_gaps_per_time_window,
+            column="col6",
+            check_func_kwargs={"window_minutes": 1440},
+        ),
+        # aggr_matches_dataset check — row count matches the reference dataset
+        DQDatasetRule(
+            criticality="error",
+            check_func=check_funcs.aggr_matches_dataset,
+            column="*",
+            check_func_kwargs={"aggr_type": "count", "ref_df_name": "ref_df_key"},
+        ),
         # is_valid_json check
         DQRowRule(
             criticality="error",
@@ -7075,6 +7286,45 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
             column="col_json_str2",
             check_func_kwargs={"schema": "STRUCT<a: STRING, b: STRING>"},
         ),
+        # is_valid_url check
+        DQRowRule(
+            criticality="error",
+            check_func=check_funcs.is_valid_url,
+            column="col_url",
+        ),
+        # is_valid_national_id check
+        DQRowRule(
+            criticality="error",
+            check_func=check_funcs.is_valid_national_id,
+            column="col_ssn",
+            check_func_kwargs={"country": "US"},
+        ),
+        DQRowRule(
+            criticality="error",
+            check_func=check_funcs.is_valid_country_code,
+            column="col_country",
+            check_func_kwargs={"code_format": "alpha-2"},
+        ),
+        # is_valid_currency_code check
+        DQRowRule(
+            criticality="error",
+            check_func=check_funcs.is_valid_currency_code,
+            column="col_currency",
+            check_func_kwargs={"code_format": "alphabetic"},
+        ),
+        # is_valid_subdivision_code check
+        DQRowRule(
+            criticality="error",
+            check_func=check_funcs.is_valid_subdivision_code,
+            column="col_subdivision",
+        ),
+        # is_valid_language_code check
+        DQRowRule(
+            criticality="error",
+            check_func=check_funcs.is_valid_language_code,
+            column="col_language",
+            check_func_kwargs={"code_format": "alpha-2"},
+        ),
     ]
 
     dq_engine = DQEngine(ws)
@@ -7082,7 +7332,9 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
     schema = (
         "col1: string, col2: int, col3: int, col4 array<int>, col5: date, col6: timestamp, "
         "col7: map<string, int>, col8: struct<field1: int>, col10: int, col11: string, "
-        "col_ipv4: string, col_ipv6: string, col_json_str: string, col_json_str2: string"
+        "col_ipv4: string, col_ipv6: string, col_json_str: string, col_json_str2: string, col_ssn: string, "
+        "col_country: string, col_currency: string, col_subdivision: string, col_language: string, "
+        "col_url: string"
     )
     test_df = spark.createDataFrame(
         [
@@ -7101,6 +7353,12 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
                 "2001:0db8:85a3:08d3:1319:8a2e:0370:7344",
                 '{"key1": "1"}',
                 '{"a" : 1, "b": 2}',
+                "123-45-6789",
+                "US",
+                "USD",
+                "US-CA",
+                "en",
+                "https://example.com/a",
             ],
             [
                 "val2",
@@ -7117,6 +7375,12 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
                 "2001:0db8:85a3:08d3:ffff:ffff:ffff:ffff",
                 '{"key1": "1", "key2": "2"}',
                 '{ "a" : 1, "b": 1000,  "c": {"1": 8}}',
+                "223-45-6789",
+                "GB",
+                "EUR",
+                "GB-ENG",
+                "en",
+                "https://sub.example.org/p?q=1",
             ],
             [
                 "val3",
@@ -7133,12 +7397,21 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
                 "2001:db8:85a3:8d3:1319:8a2e:3.112.115.68",
                 '{"key1": "[1, 2, 3]"}',
                 '{ "a" : 1, "b": 1023455,  "c": null }',
+                "323-45-6789",
+                "DE",
+                "GBP",
+                "DE-BY",
+                "de",
+                "ftp://files.example.org/f.txt",
             ],
         ],
         schema,
     )
 
-    checked = dq_engine.apply_checks(test_df, checks)
+    ref_df = test_df.withColumnRenamed("col1", "ref_col1").withColumnRenamed("col2", "ref_col2")
+    ref_dfs = {"ref_df_key": ref_df}
+
+    checked = dq_engine.apply_checks(test_df, checks, ref_dfs=ref_dfs)
 
     expected_schema = schema + REPORTING_COLUMNS
     expected = spark.createDataFrame(
@@ -7158,6 +7431,12 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
                 "2001:0db8:85a3:08d3:1319:8a2e:0370:7344",
                 '{"key1": "1"}',
                 '{"a" : 1, "b": 2}',
+                "123-45-6789",
+                "US",
+                "USD",
+                "US-CA",
+                "en",
+                "https://example.com/a",
                 None,
                 None,
             ],
@@ -7176,6 +7455,12 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
                 "2001:0db8:85a3:08d3:ffff:ffff:ffff:ffff",
                 '{"key1": "1", "key2": "2"}',
                 '{ "a" : 1, "b": 1000,  "c": {"1": 8}}',
+                "223-45-6789",
+                "GB",
+                "EUR",
+                "GB-ENG",
+                "en",
+                "https://sub.example.org/p?q=1",
                 None,
                 None,
             ],
@@ -7194,6 +7479,12 @@ def test_apply_checks_all_checks_using_classes(ws, spark):
                 "2001:db8:85a3:8d3:1319:8a2e:3.112.115.68",
                 '{"key1": "[1, 2, 3]"}',
                 '{ "a" : 1, "b": 1023455,  "c": null }',
+                "323-45-6789",
+                "DE",
+                "GBP",
+                "DE-BY",
+                "de",
+                "ftp://files.example.org/f.txt",
                 None,
                 None,
             ],
@@ -8966,6 +9257,51 @@ def test_apply_aggr_checks_by_metadata(ws, spark):
     assert_df_equality(all_df, expected_df)
 
 
+def test_apply_aggr_star_check_with_filter_by_metadata(ws, spark):
+    """Regression for #1435: the exact declarative repro shape - a count(*) aggregate check combined with
+    a filter - must apply without raising INVALID_USAGE_OF_STAR_OR_REGEX and count only the filtered rows."""
+    dq_engine = DQEngine(workspace_client=ws, extra_params=EXTRA_PARAMS)
+    # SCHEMA = "a: int, b: int, c: int"; 2 of the 3 rows have b is not null
+    test_df = spark.createDataFrame([[1, 1, 1], [2, None, 2], [3, 3, 3]], SCHEMA)
+
+    checks = [
+        {
+            "criticality": "error",
+            "filter": "b is not null",
+            "check": {
+                "function": "is_aggr_not_less_than",
+                "arguments": {"column": "*", "aggr_type": "count", "limit": 100},
+            },
+        }
+    ]
+
+    # Applying the check must not raise INVALID_USAGE_OF_STAR_OR_REGEX.
+    checked_df = dq_engine.apply_checks_by_metadata(test_df, checks)
+
+    # count over the 2 filtered rows is 2 (< 100) -> a single violation reported on every row,
+    # since the aggregation is computed over all filtered rows (no group_by).
+    error = {
+        "name": "count_less_than_limit",
+        "message": "Count value 2 in column '*' is less than limit: 100",
+        "columns": ["*"],
+        "filter": "b is not null",
+        "function": "is_aggr_not_less_than",
+        "run_time": RUN_TIME,
+        "run_id": RUN_ID,
+        "user_metadata": {},
+    }
+    expected_df = spark.createDataFrame(
+        [
+            [1, 1, 1, [error], None],
+            [2, None, 2, None, None],  # filtered out by "b is not null" -> check not applied to this row
+            [3, 3, 3, [error], None],
+        ],
+        EXPECTED_SCHEMA,
+    )
+
+    assert_df_equality(checked_df, expected_df)
+
+
 def test_apply_checks_raises_error_when_passed_dict_instead_of_dqrules(ws, spark):
     dq_engine = DQEngine(ws)
     src_df = spark.createDataFrame([[1, 3, 3]], SCHEMA)
@@ -9363,7 +9699,7 @@ def test_compare_datasets_check_missing_records_with_partial_filter(
 
     catalog_name = TEST_CATALOG
     ref_table_schema = make_schema(catalog_name=catalog_name)
-    ref_table = f"{catalog_name}.{ref_table_schema.name}.{make_random(10).lower()}"
+    ref_table = f"{catalog_name}.{ref_table_schema.name}.t{make_random(10).lower()}"
     ref_df.write.saveAsTable(ref_table)
 
     pk_columns = ["id"]
@@ -10000,29 +10336,19 @@ def test_apply_checks_with_has_valid_schema_extra_columns_in_params(ws, spark):
 
     expected_schema = schema + REPORTING_COLUMNS
 
-    expected_skip_strict = {
-        "name": "has_valid_schema_strict",
-        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']",
-        "columns": ["id", "v1", "missing_col"],
-        "filter": None,
-        "function": "has_valid_schema",
-        "run_time": RUN_TIME,
-        "run_id": RUN_ID,
-        "user_metadata": {},
-        "skipped": True,
-    }
+    expected_skip_strict = build_skipped_violation(
+        name="has_valid_schema_strict",
+        message="Check evaluation skipped due to invalid check columns: ['missing_col']",
+        columns=["id", "v1", "missing_col"],
+        function="has_valid_schema",
+    )
 
-    expected_skip_permissive = {
-        "name": "has_valid_schema_permissive",
-        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']",
-        "columns": ["id", "v1", "missing_col"],
-        "filter": None,
-        "function": "has_valid_schema",
-        "run_time": RUN_TIME,
-        "run_id": RUN_ID,
-        "user_metadata": {},
-        "skipped": True,
-    }
+    expected_skip_permissive = build_skipped_violation(
+        name="has_valid_schema_permissive",
+        message="Check evaluation skipped due to invalid check columns: ['missing_col']",
+        columns=["id", "v1", "missing_col"],
+        function="has_valid_schema",
+    )
 
     expected = spark.createDataFrame(
         [
@@ -10033,6 +10359,84 @@ def test_apply_checks_with_has_valid_schema_extra_columns_in_params(ws, spark):
     )
 
     assert_df_equality(checked.sort("id"), expected.sort("id"), ignore_nullable=True)
+
+
+def test_apply_checks_with_has_valid_schema_special_char_columns_are_valid(ws, spark):
+    """Column names with spaces / non-ASCII characters (that require SQL identifier escaping)
+    must be treated as valid and the check must run instead of being skipped."""
+    dq_engine = DQEngine(workspace_client=ws, extra_params=EXTRA_PARAMS)
+
+    schema = "id int, `Customer Name` string, `Ääkkönen` int"
+    test_df = spark.createDataFrame([[1, "Alice", 10], [2, "Bob", 20]], schema)
+
+    checks = [
+        DQDatasetRule(
+            name="has_valid_schema",
+            criticality="warn",
+            check_func=check_funcs.has_valid_schema,
+            check_func_kwargs={
+                "expected_schema": "id int, `Customer Name` string, `Ääkkönen` int",
+                "columns": ["id", "Customer Name", "Ääkkönen"],
+                "strict": False,
+            },
+        ),
+    ]
+    checked = dq_engine.apply_checks(test_df, checks)
+
+    expected = spark.createDataFrame(
+        [
+            [1, "Alice", 10, None, None],
+            [2, "Bob", 20, None, None],
+        ],
+        schema + REPORTING_COLUMNS,
+    )
+    assert_df_equality(checked.sort("id"), expected.sort("id"), ignore_nullable=True)
+
+
+def test_apply_checks_unsafe_filter_is_skipped_and_other_checks_still_run(ws, spark):
+    """A check with an unsafe (destructive-SQL) filter is skipped through DQRuleManager while every other
+    check in the same rule set is still evaluated end-to-end — the run is not aborted."""
+    dq_engine = DQEngine(workspace_client=ws, extra_params=EXTRA_PARAMS)
+    test_df = spark.createDataFrame([[1, None], [2, "ok"]], "id int, b string")
+
+    checks = [
+        # unsafe filter (destructive keyword) -> this check is skipped, not evaluated
+        DQRowRule(
+            name="b_is_null_unsafe_filter",
+            criticality="error",
+            check_func=check_funcs.is_not_null,
+            column="b",
+            filter="id = 1 OR DROP TABLE users",
+        ),
+        # a normal check that must still run and flag the null in row id=1
+        DQRowRule(
+            name="b_is_null",
+            criticality="error",
+            check_func=check_funcs.is_not_null,
+            column="b",
+        ),
+    ]
+
+    checked = dq_engine.apply_checks(test_df, checks)
+    errors_by_row = {row["id"]: row["_errors"] for row in checked.select("id", "_errors").collect()}
+
+    # The unsafe-filter check couldn't be evaluated, so it's reported as skipped on every row
+    # (a dataset-wide "not evaluated" marker, consistent with other skipped checks) rather than
+    # aborting the whole run.
+    for row_id in (1, 2):
+        skipped = [e for e in (errors_by_row[row_id] or []) if e["name"] == "b_is_null_unsafe_filter"]
+        assert len(skipped) == 1, f"row {row_id}: {errors_by_row[row_id]}"
+        assert skipped[0]["skipped"] is True
+        assert skipped[0]["message"] == (
+            "Check evaluation skipped due to unsafe check filter: 'id = 1 OR DROP TABLE users'"
+        )
+
+    # The normal check still ran end-to-end: it flags the null b for row id=1 and passes row id=2.
+    normal_row1 = [e for e in (errors_by_row[1] or []) if e["name"] == "b_is_null"]
+    assert len(normal_row1) == 1
+    assert normal_row1[0]["skipped"] is None
+    normal_row2 = [e for e in (errors_by_row[2] or []) if e["name"] == "b_is_null"]
+    assert len(normal_row2) == 0
 
 
 def test_apply_checks_and_save_in_tables_for_patterns_missing_output_suffix(ws, spark):
@@ -10149,76 +10553,49 @@ def test_apply_checks_skip_checks_with_missing_columns(ws, spark):
                 {"key1": 1},
                 {"field1": 1},
                 [
-                    {
-                        "name": "b_is_null_or_empty",
-                        "message": "Check evaluation skipped due to invalid check filter: 'missing_col > 0'",
-                        "columns": ["b"],
-                        "filter": "missing_col > 0",
-                        "function": "is_not_null_and_not_empty",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
-                    {
-                        "name": "missing_col_is_null",
-                        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']",
-                        "columns": ["missing_col"],
-                        "filter": None,
-                        "function": "is_not_null",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
-                    {
-                        "name": "missing_col_sql_expression",
-                        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']; "
+                    build_skipped_violation(
+                        name="b_is_null_or_empty",
+                        message="Check evaluation skipped due to invalid check filter: 'missing_col > 0'",
+                        columns=["b"],
+                        function="is_not_null_and_not_empty",
+                        filter_expr="missing_col > 0",
+                    ),
+                    build_skipped_violation(
+                        name="missing_col_is_null",
+                        message="Check evaluation skipped due to invalid check columns: ['missing_col']",
+                        columns=["missing_col"],
+                    ),
+                    build_skipped_violation(
+                        name="missing_col_sql_expression",
+                        message="Check evaluation skipped due to invalid check columns: ['missing_col']; "
                         "Check evaluation skipped due to invalid sql expression: 'missing_col > 0'",
-                        "columns": ["missing_col"],
-                        "filter": None,
-                        "function": "sql_expression",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
-                    {
-                        "name": "missing_col_is_unique",
-                        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']; "
+                        columns=["missing_col"],
+                        function="sql_expression",
+                    ),
+                    build_skipped_violation(
+                        name="missing_col_is_unique",
+                        message="Check evaluation skipped due to invalid check columns: ['missing_col']; "
                         "Check evaluation skipped due to invalid check filter: 'missing_col > 0'",
-                        "columns": ["missing_col"],
-                        "filter": "missing_col > 0",
-                        "function": "is_unique",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
-                    {
-                        "name": "invalid_col_sql_expression",
-                        "message": "Check evaluation skipped due to invalid sql expression: 'missing_col > 0'",
-                        "columns": None,
-                        "filter": None,
-                        "function": "sql_expression",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
+                        columns=["missing_col"],
+                        function="is_unique",
+                        filter_expr="missing_col > 0",
+                    ),
+                    build_skipped_violation(
+                        name="invalid_col_sql_expression",
+                        message="Check evaluation skipped due to invalid sql expression: 'missing_col > 0'",
+                        columns=None,
+                        function="sql_expression",
+                    ),
                 ],
                 [
-                    {
-                        "name": "missing_col_is_null_or_empty",
-                        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']",
-                        "columns": ["missing_col"],
-                        "filter": "a > 0",
-                        "function": "is_not_null_and_not_empty",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {"tag1": "value1", "tag2": "value2"},
-                        "skipped": True,
-                    },
+                    build_skipped_violation(
+                        name="missing_col_is_null_or_empty",
+                        message="Check evaluation skipped due to invalid check columns: ['missing_col']",
+                        columns=["missing_col"],
+                        function="is_not_null_and_not_empty",
+                        filter_expr="a > 0",
+                        user_metadata={"tag1": "value1", "tag2": "value2"},
+                    ),
                 ],
             ]
         ],
@@ -10333,76 +10710,49 @@ def test_apply_checks_by_metadata_skip_checks_with_missing_columns(ws, spark):
                 {"key1": 1},
                 {"field1": 1},
                 [
-                    {
-                        "name": "b_is_null_or_empty",
-                        "message": "Check evaluation skipped due to invalid check filter: 'missing_col > 0'",
-                        "columns": ["b"],
-                        "filter": "missing_col > 0",
-                        "function": "is_not_null_and_not_empty",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
-                    {
-                        "name": "missing_col_is_null",
-                        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']",
-                        "columns": ["missing_col"],
-                        "filter": None,
-                        "function": "is_not_null",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
-                    {
-                        "name": "missing_col_sql_expression",
-                        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']; "
+                    build_skipped_violation(
+                        name="b_is_null_or_empty",
+                        message="Check evaluation skipped due to invalid check filter: 'missing_col > 0'",
+                        columns=["b"],
+                        function="is_not_null_and_not_empty",
+                        filter_expr="missing_col > 0",
+                    ),
+                    build_skipped_violation(
+                        name="missing_col_is_null",
+                        message="Check evaluation skipped due to invalid check columns: ['missing_col']",
+                        columns=["missing_col"],
+                    ),
+                    build_skipped_violation(
+                        name="missing_col_sql_expression",
+                        message="Check evaluation skipped due to invalid check columns: ['missing_col']; "
                         "Check evaluation skipped due to invalid sql expression: 'missing_col > 0'",
-                        "columns": ["missing_col"],
-                        "filter": None,
-                        "function": "sql_expression",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
-                    {
-                        "name": "missing_col_is_unique",
-                        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']; "
+                        columns=["missing_col"],
+                        function="sql_expression",
+                    ),
+                    build_skipped_violation(
+                        name="missing_col_is_unique",
+                        message="Check evaluation skipped due to invalid check columns: ['missing_col']; "
                         "Check evaluation skipped due to invalid check filter: 'missing_col > 0'",
-                        "columns": ["missing_col"],
-                        "filter": "missing_col > 0",
-                        "function": "is_unique",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
-                    {
-                        "name": "invalid_col_sql_expression",
-                        "message": "Check evaluation skipped due to invalid sql expression: 'missing_col > 0'",
-                        "columns": None,
-                        "filter": None,
-                        "function": "sql_expression",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {},
-                        "skipped": True,
-                    },
+                        columns=["missing_col"],
+                        function="is_unique",
+                        filter_expr="missing_col > 0",
+                    ),
+                    build_skipped_violation(
+                        name="invalid_col_sql_expression",
+                        message="Check evaluation skipped due to invalid sql expression: 'missing_col > 0'",
+                        columns=None,
+                        function="sql_expression",
+                    ),
                 ],
                 [
-                    {
-                        "name": "missing_col_is_null_or_empty",
-                        "message": "Check evaluation skipped due to invalid check columns: ['missing_col']",
-                        "columns": ["missing_col"],
-                        "filter": "a > 0",
-                        "function": "is_not_null_and_not_empty",
-                        "run_time": RUN_TIME,
-                        "run_id": RUN_ID,
-                        "user_metadata": {"tag1": "value1", "tag2": "value2"},
-                        "skipped": True,
-                    },
+                    build_skipped_violation(
+                        name="missing_col_is_null_or_empty",
+                        message="Check evaluation skipped due to invalid check columns: ['missing_col']",
+                        columns=["missing_col"],
+                        function="is_not_null_and_not_empty",
+                        filter_expr="a > 0",
+                        user_metadata={"tag1": "value1", "tag2": "value2"},
+                    ),
                 ],
             ]
         ],

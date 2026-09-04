@@ -18,12 +18,23 @@ from databricks.labs.dqx.config import InputConfig, LLMModelConfig
 from databricks.labs.dqx.errors import MissingParameterError, InvalidConfigError
 from databricks.labs.dqx.io import read_input_data, STORAGE_PATH_PATTERN
 from databricks.labs.dqx.profiler.profile import DQProfile
-from databricks.labs.dqx.profiler.profile_builder import PROFILE_BUILDER_REGISTRY, TEXT_TYPES
+from databricks.labs.dqx.profiler.profile_builder import PROFILE_BUILDER_REGISTRY, TEXT_TYPES, validate_profile_options
+from databricks.labs.dqx.profiler.profile_options import (
+    DEFAULT_PROFILE_OPTIONS,
+    PROFILE_OPTION_FILTER,
+    PROFILE_OPTION_LIMIT,
+    PROFILE_OPTION_LLM_PRIMARY_KEY_DETECTION,
+    PROFILE_OPTION_SAMPLE_BY_COLUMN,
+    PROFILE_OPTION_SAMPLE_BY_VALUES_LIMIT,
+    PROFILE_OPTION_SAMPLE_FRACTION,
+    PROFILE_OPTION_SAMPLE_SEED,
+    PROFILE_OPTION_TRIM_STRINGS,
+)
 from databricks.labs.dqx.utils import list_tables
 from databricks.labs.dqx.telemetry import telemetry_logger
 
 try:
-    from databricks.labs.dqx.llm.llm_engine import DQLLMEngine
+    from databricks.labs.dqx.llm.llm_pk_engine import DQLLMPrimaryKeyEngine
 
     LLM_ENABLED = True
 except ImportError:
@@ -45,24 +56,9 @@ class DQProfiler(DQEngineBase):
         self.spark = SparkSession.builder.getOrCreate() if spark is None else spark
 
         llm_model_config = llm_model_config or LLMModelConfig()
-        self.llm_engine = DQLLMEngine(model_config=llm_model_config, spark=self.spark) if LLM_ENABLED else None
-
-    default_profile_options = {
-        "round": True,  # round the min/max values
-        "max_in_count": 10,  # generate is_in if we have less than 1 percent of distinct values
-        "distinct_ratio": 0.05,  # generate is_in if we have less than 1 percent of distinct values
-        "max_null_ratio": 0.01,  # generate is_not_null if we have less than 1 percent of nulls
-        "remove_outliers": True,  # remove outliers
-        "outlier_columns": [],  # remove outliers in the columns
-        "num_sigmas": 3,  # number of sigmas to use when remove_outliers is True
-        "trim_strings": True,  # trim whitespace from strings
-        "max_empty_ratio": 0.01,  # generate is_not_null_or_empty rule if we have less than 1 percent of empty strings
-        "sample_fraction": 0.3,  # fraction of data to sample (30%)
-        "sample_seed": None,  # seed for sampling
-        "limit": 1000,  # limit the number of samples
-        "filter": None,  # filter to apply to the dataset
-        "llm_primary_key_detection": True,  # detect primary keys
-    }
+        self.llm_engine = (
+            DQLLMPrimaryKeyEngine(model_config=llm_model_config, spark=self.spark) if LLM_ENABLED else None
+        )
 
     @staticmethod
     def get_columns_or_fields(columns: list[T.StructField]) -> list[T.StructField]:
@@ -109,7 +105,8 @@ class DQProfiler(DQEngineBase):
         if options is None:
             options = {}
 
-        options = {**self.default_profile_options, **options}  # merge default options with user-provided options
+        options = {**DEFAULT_PROFILE_OPTIONS, **options}  # merge default options with user-provided options
+        validate_profile_options(options)  # fail fast on misconfiguration before any profiling work
         df = self._sample(df, options)
 
         dq_rules: list[DQProfile] = []
@@ -295,7 +292,7 @@ class DQProfiler(DQEngineBase):
         """
         matched_options = DQProfiler._match_options_list(table, options)
         sorted_options = DQProfiler._sort_options_list(table, matched_options)
-        built_options = DQProfiler.default_profile_options.copy()
+        built_options = DEFAULT_PROFILE_OPTIONS.copy()
         for opt in sorted_options:
             if opt and isinstance(opt, dict):
                 built_options |= opt.get("options") or {}
@@ -338,19 +335,85 @@ class DQProfiler(DQEngineBase):
 
     @staticmethod
     def _sample(df: DataFrame, opts: dict[str, Any]) -> DataFrame:
-        sample_fraction = opts.get("sample_fraction", None)
-        sample_seed = opts.get("sample_seed", None)
-        limit = opts.get("limit", None)
-        filter_dataset = opts.get("filter", None)
+        sample_fraction = opts.get(PROFILE_OPTION_SAMPLE_FRACTION, None)
+        sample_seed = opts.get(PROFILE_OPTION_SAMPLE_SEED, None)
+        sample_by_column = opts.get(PROFILE_OPTION_SAMPLE_BY_COLUMN, None)
+        sample_by_values_limit = opts.get(PROFILE_OPTION_SAMPLE_BY_VALUES_LIMIT, None)
+        limit = opts.get(PROFILE_OPTION_LIMIT, None)
+        filter_dataset = opts.get(PROFILE_OPTION_FILTER, None)
 
         if filter_dataset:
             df = df.filter(filter_dataset)
-        if sample_fraction:
+
+        if isinstance(sample_fraction, dict) and not sample_by_column:
+            raise InvalidConfigError("sample_fraction must be of type float when sample_by_column is not set.")
+
+        if sample_by_column:
+            df = DQProfiler._stratified_sample(
+                df, sample_by_column, sample_fraction, sample_seed, sample_by_values_limit
+            )
+        elif sample_fraction is not None:
             df = df.sample(withReplacement=False, fraction=sample_fraction, seed=sample_seed)
         if limit:
             df = df.limit(limit)
 
         return df
+
+    @staticmethod
+    def _stratified_sample(
+        df: DataFrame,
+        sample_by_column: str,
+        sample_fraction: float | dict[Any, float] | None,
+        sample_seed: int | None,
+        sample_by_values_limit: int | None = None,
+    ) -> DataFrame:
+        """
+        Draw a stratified sample across the unique values of the specified *sample_by_column*.
+        Uses the *sample_fraction* to control the sampling rate:
+
+        * When *sample_fraction* is a dict, each value controls the sampling fraction for the slice key.
+          Strata not present in the dict are assigned a fraction of 0 and excluded from the sample.
+        * When *sample_fraction* is a float, the profiler samples uniformly across all slice values
+
+        When a uniform *sample_fraction* is used, the distinct values are collected. To bound this
+        collection on high-cardinality columns, at most *sample_by_values_limit* distinct values are
+        collected; rows whose *sample_by_column* value falls outside the limit are excluded from the sample.
+
+        Args:
+            df: Input DataFrame to sample.
+            sample_by_column: Name of the column to slice by.
+            sample_fraction: Per-slice dictionary of slice value and fraction or a uniform float applied
+                to every distinct value of *sample_by_column*.
+            sample_seed: Optional seed for reproducible sampling.
+            sample_by_values_limit: Maximum number of distinct *sample_by_column* values to collect when
+                *sample_fraction* is a uniform float. Ignored when *sample_fraction* is a dict.
+
+        Returns:
+            A stratified sample of the input DataFrame.
+
+        Raises:
+            InvalidConfigError: If *sample_by_column* is not a column of the DataFrame, or if
+                *sample_fraction* is missing.
+        """
+        if sample_by_column not in df.columns:
+            raise InvalidConfigError(f"sample_by_column '{sample_by_column}' is not a column of the input DataFrame.")
+
+        if isinstance(sample_fraction, dict):
+            sample_fractions = sample_fraction
+        else:
+            if sample_fraction is None:
+                raise InvalidConfigError("sample_fraction must be provided when sample_by_column is set.")
+            # Order before limiting so that *which* strata are kept is deterministic; otherwise
+            # ``distinct().limit()`` returns an arbitrary subset and the sample would not be
+            # reproducible across runs even when ``sample_seed`` is set.
+            distinct_values = df.select(sample_by_column).distinct().orderBy(sample_by_column)
+            if sample_by_values_limit is not None:
+                distinct_values = distinct_values.limit(sample_by_values_limit)
+            slice_values = [row[0] for row in distinct_values.toLocalIterator()]
+            sample_fractions = {slice_value: sample_fraction for slice_value in slice_values}
+
+        logger.info(f"Stratified sampling on column '{sample_by_column}'")
+        return df.sampleBy(sample_by_column, fractions=sample_fractions, seed=sample_seed)
 
     def _profile(
         self,
@@ -376,7 +439,7 @@ class DQProfiler(DQEngineBase):
             summary_stats: Summary statistics dictionary to update with profiler results.
             total_count: Total number of rows in the input DataFrame.
         """
-        trim_strings = opts.get("trim_strings", True)
+        trim_strings = opts.get(PROFILE_OPTION_TRIM_STRINGS, True)
 
         for field in self.get_columns_or_fields(df_cols):
             field_name = field.name
@@ -421,8 +484,10 @@ class DQProfiler(DQEngineBase):
         """Run registered profile builders for a column and append profiles.
 
         Builders are invoked in PROFILE_BUILDER_REGISTRY insertion order (null_or_empty →
-        is_in → min_max). Preserving that order matters: the min_max builder reads summary-stats
-        metrics written by earlier passes, so it must run last among the built-in builders.
+        is_in → min_max → has_no_outliers). Preserving that order matters: the min_max builder
+        reads summary-stats metrics written by earlier passes, so it must run after them. Any
+        builder that depends on min_max's resolved min/max (written back into *metrics* below)
+        must be registered after min_max.
 
         After a min_max profile is produced, its resolved min/max values are written back into
         *metrics* so that downstream consumers (e.g. LLM primary-key detection) can read them
@@ -453,7 +518,7 @@ class DQProfiler(DQEngineBase):
             summary_stats: Summary statistics dictionary to update with PK detection results
             opts: A dictionary of options for profiling.
         """
-        if not LLM_ENABLED or not opts.get("llm_primary_key_detection", False):
+        if not LLM_ENABLED or not opts.get(PROFILE_OPTION_LLM_PRIMARY_KEY_DETECTION, False):
             return
 
         logger.info("🤖 Starting LLM-based primary key detection for DataFrame")
@@ -483,7 +548,7 @@ class DQProfiler(DQEngineBase):
                             name="is_unique",
                             column=",".join(valid_columns),
                             parameters={"nulls_distinct": False, "reasoning": reasoning, "confidence": confidence},
-                            filter=opts.get("filter", None),
+                            filter=opts.get(PROFILE_OPTION_FILTER, None),
                             description=f"LLM-detected primary key columns: {', '.join(valid_columns)}",
                         )
                     )

@@ -6,6 +6,7 @@ import pytest
 
 from databricks.labs.dqx.errors import MissingParameterError
 import databricks.labs.dqx.profiler.generator as generator_module
+from databricks.labs.dqx.profiler.profile import DQProfile
 
 
 def test_profiler_llm_disabled(generator, monkeypatch):
@@ -64,3 +65,29 @@ def test_generate_dq_rules_ai_assisted_keeps_valid_drops_invalid(generator, capl
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1, f"Expected one WARNING for the invalid rule only, got {warnings}"
     assert "nonexistent_function_xyz" in warnings[0].getMessage()
+
+
+def test_generate_has_no_outliers(generator, caplog):
+    """Test to check has_no_outliers rule generated out from profile"""
+    profiles = [DQProfile(name="has_no_outliers", column="measurement")]
+    rules = generator.generate_dq_rules(profiles)
+    assert len(rules) == 1
+    assert "has_no_outliers" in rules[0]["check"]["function"]
+    assert "measurement" in rules[0]["check"]["arguments"]["column"]
+    assert "error" in rules[0]["criticality"]
+
+
+def test_generate_is_in_quotes_string_values(generator):
+    """is_in_list resolves bare strings as column expressions, so generated string allowlist values
+    must be quoted to be compared as string literals. Single quotes are escaped; non-string values
+    (numbers) are passed through unchanged."""
+    profiles = [
+        DQProfile(name="is_in", column="status", parameters={"in": ["active", "O'Brien"]}),
+        DQProfile(name="is_in", column="code", parameters={"in": [1, 2, 3]}),
+    ]
+
+    rules = generator.generate_dq_rules(profiles)
+
+    assert rules[0]["check"]["function"] == "is_in_list"
+    assert rules[0]["check"]["arguments"]["allowed"] == ["'active'", "'O\\'Brien'"]
+    assert rules[1]["check"]["arguments"]["allowed"] == [1, 2, 3]

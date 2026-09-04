@@ -1,0 +1,72 @@
+import { Outlet } from "@tanstack/react-router";
+import type { ReactNode } from "react";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarInset,
+  SidebarProvider,
+  SidebarRail,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
+import { ModeToggle } from "@/components/layout/mode-toggle";
+import Logo from "@/components/layout/Logo";
+import HeaderUserMenu from "@/components/layout/HeaderUserMenu";
+
+interface SidebarLayoutProps {
+  children?: ReactNode;
+}
+
+function SidebarLayout({ children }: SidebarLayoutProps) {
+  return (
+    <div className="flex flex-col h-screen overflow-x-hidden">
+      {/* Fixed top banner — independent of sidebar, never shifts */}
+      <header className="sticky top-0 z-50 bg-background border-b shrink-0">
+        <div className="flex h-12 items-center justify-between px-4">
+          <div className="flex items-center gap-3">
+            <Logo />
+          </div>
+          <div className="flex items-center gap-1">
+            <ModeToggle />
+            <HeaderUserMenu />
+          </div>
+        </div>
+      </header>
+
+      {/* Sidebar + main content below the banner. `min-h-0` overrides the
+          shadcn default `min-h-svh` on SidebarProvider — that default
+          assumes SidebarProvider is the full-viewport root, but here it
+          sits below our fixed header, so `min-h-svh` was forcing the total
+          layout past 100vh and causing a second (body-level) scrollbar in
+          addition to the intended inner one. */}
+      <SidebarProvider className="flex-1 min-h-0">
+        <Sidebar collapsible="icon" className="top-12 h-[calc(100vh-3rem)]">
+          <SidebarContent className="flex flex-col justify-between">
+            {children}
+          </SidebarContent>
+          <SidebarRail />
+        </Sidebar>
+        <SidebarInset className="flex flex-col min-h-0 min-w-0">
+          <div className="flex items-center h-10 px-4 shrink-0">
+            <SidebarTrigger className="-ml-1 cursor-pointer" />
+          </div>
+          {/* `scrollbar-gutter: stable` keeps the `max-w-7xl mx-auto` page
+              content in the SAME horizontal position whether or not the
+              vertical scrollbar is present. Without it, with classic
+              (non-overlay) scrollbars a tall tab (e.g. a Monitored Table's
+              About tab listing every column) summons the scrollbar, shrinks
+              this scroller, and `mx-auto` re-centers the content a few px
+              LEFT of its position on shorter sibling tabs (P23 item 15). */}
+          <div
+            data-scroll-root
+            className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden [scrollbar-gutter:stable]"
+          >
+            <div className="flex flex-col gap-4 p-6 pt-0 max-w-7xl mx-auto min-w-0">
+              <Outlet />
+            </div>
+          </div>
+        </SidebarInset>
+      </SidebarProvider>
+    </div>
+  );
+}
+export default SidebarLayout;

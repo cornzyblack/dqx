@@ -2,6 +2,7 @@ import pytest
 from databricks.labs.dqx.config import (
     WorkspaceConfig,
     RunConfig,
+    BaseChecksStorageConfig,
     InstallationChecksStorageConfig,
     FileChecksStorageConfig,
     LakebaseChecksStorageConfig,
@@ -14,6 +15,8 @@ from databricks.labs.dqx.config import (
     LLMModelConfig,
     LLMConfig,
     ExtraParams,
+    TABLE_PATTERN,
+    UC_TABLE_PATTERN,
 )
 from databricks.labs.dqx.errors import InvalidConfigError, InvalidParameterError
 
@@ -215,6 +218,8 @@ def test_profiler_config_defaults():
     assert config.summary_stats_file == "profile_summary_stats.yml"
     assert config.sample_fraction == 0.3
     assert config.sample_seed is None
+    assert config.sample_by_column is None
+    assert config.sample_by_values_limit == 1000
     assert config.limit == 1000
     assert config.filter is None
     assert config.criticality == "error"
@@ -225,6 +230,8 @@ def test_profiler_config_custom_values():
         summary_stats_file="custom_stats.yml",
         sample_fraction=0.5,
         sample_seed=42,
+        sample_by_column="region",
+        sample_by_values_limit=250,
         limit=5000,
         filter="col1 > 0",
         criticality="warn",
@@ -232,9 +239,20 @@ def test_profiler_config_custom_values():
     assert config.summary_stats_file == "custom_stats.yml"
     assert config.sample_fraction == 0.5
     assert config.sample_seed == 42
+    assert config.sample_by_column == "region"
+    assert config.sample_by_values_limit == 250
     assert config.limit == 5000
     assert config.filter == "col1 > 0"
     assert config.criticality == "warn"
+
+
+def test_profiler_config_accepts_dict_sample_fraction():
+    config = ProfilerConfig(
+        sample_by_column="region",
+        sample_fraction={"us": 1.0, "eu": 0.1},
+    )
+    assert config.sample_by_column == "region"
+    assert config.sample_fraction == {"us": 1.0, "eu": 0.1}
 
 
 # Test LLMModelConfig
@@ -245,13 +263,82 @@ def test_llm_model_config_defaults():
     assert config.api_base == ""
 
 
+def test_llm_model_config_max_retries_default():
+    assert LLMModelConfig().max_retries == 3
+
+
+def test_llm_model_config_max_retries_accepts_zero():
+    """0 disables retries entirely — useful for tests that want to surface failures fast."""
+    assert LLMModelConfig(max_retries=0).max_retries == 0
+
+
+def test_llm_model_config_rejects_negative_max_retries():
+    with pytest.raises(InvalidParameterError, match="max_retries must be a non-negative integer"):
+        LLMModelConfig(max_retries=-1)
+
+
+def test_llm_model_config_rejects_non_integer_max_retries():
+    with pytest.raises(InvalidParameterError, match="max_retries must be a non-negative integer"):
+        LLMModelConfig(max_retries=2.5)  # type: ignore[arg-type]
+
+
+def test_llm_model_config_rejects_bool_max_retries():
+    """``True``/``False`` are ints in Python but a clear typo in this context — reject explicitly."""
+    with pytest.raises(InvalidParameterError, match="max_retries must be a non-negative integer"):
+        LLMModelConfig(max_retries=True)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.5, True, None])
+def test_llm_model_config_rejects_invalid_max_tokens(bad):
+    # Must be a positive int — a clean InvalidParameterError instead of a raw TypeError at
+    # ai_query SQL-build time, and no non-positive value reaching the endpoint.
+    with pytest.raises(InvalidParameterError, match="max_tokens must be a positive integer"):
+        LLMModelConfig(max_tokens=bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad", [-0.1, -1, True, None])
+def test_llm_model_config_rejects_invalid_temperature(bad):
+    with pytest.raises(InvalidParameterError, match="temperature must be a non-negative number"):
+        LLMModelConfig(temperature=bad)  # type: ignore[arg-type]
+
+
+def test_llm_model_config_accepts_valid_budget_values():
+    config = LLMModelConfig(max_tokens=256, temperature=0.5)
+    assert config.max_tokens == 256
+    assert config.temperature == 0.5
+
+
 def test_llm_model_config_custom_values():
     config = LLMModelConfig(
-        model_name="custom-model", api_key="secret_scope/secret_key", api_base="https://api.example.com"
+        model_name="custom-model",
+        api_key="secret_scope/secret_key",
+        api_base="https://api.openai.com",
     )
     assert config.model_name == "custom-model"
     assert config.api_key == "secret_scope/secret_key"
-    assert config.api_base == "https://api.example.com"
+    assert config.api_base == "https://api.openai.com"
+    assert config.max_tokens == 1000
+    assert config.temperature == 0.0
+    assert config.timeout == 30.0
+
+
+def test_llm_model_config_budget_overrides():
+    config = LLMModelConfig(max_tokens=500, temperature=0.7, timeout=15.0)
+    assert config.model_name == "databricks/databricks-claude-sonnet-4-5"
+    assert config.api_key == ""
+    assert config.api_base == ""
+    assert config.max_tokens == 500
+    assert config.temperature == 0.7
+    assert config.timeout == 15.0
+
+
+def test_llm_model_config_api_base_stored_verbatim():
+    # api_base is consumed by the LLM rule-generation / profiler path (URL or a
+    # secret_scope/secret_key reference resolved downstream); the anomaly AI-explanation path
+    # uses model_name -> a Databricks Model Serving endpoint and ignores api_base. It is stored
+    # as-is with no validation here.
+    assert LLMModelConfig(api_base="my_scope/my_key").api_base == "my_scope/my_key"
+    assert LLMModelConfig(api_base="https://api.openai.com").api_base == "https://api.openai.com"
 
 
 # Test LLMConfig
@@ -469,3 +556,139 @@ def test_lakebase_checks_storage_config_with_custom_run_config_and_fingerprint()
     assert config.instance_name == "my_instance"
     assert config.run_config_name == "prod"
     assert config.rule_set_fingerprint == rule_set_fingerprint
+
+
+@pytest.mark.parametrize(
+    "config,changes,changed_field,expected_value,preserved_field,preserved_value",
+    [
+        (
+            FileChecksStorageConfig(location="/p/checks.yml"),
+            {"location": "/p/other.yml"},
+            "location",
+            "/p/other.yml",
+            None,
+            None,
+        ),
+        (
+            WorkspaceFileChecksStorageConfig(location="/Workspace/checks.yml"),
+            {"location": "/Workspace/other.yml"},
+            "location",
+            "/Workspace/other.yml",
+            None,
+            None,
+        ),
+        (
+            TableChecksStorageConfig(location="cat.sch.tbl", mode="append", run_config_name="rc"),
+            {"mode": "overwrite"},
+            "mode",
+            "overwrite",
+            "run_config_name",
+            "rc",
+        ),
+        (
+            VolumeFileChecksStorageConfig(location="/Volumes/c/s/v/checks.yml"),
+            {"location": "/Volumes/c/s/v/other.yml"},
+            "location",
+            "/Volumes/c/s/v/other.yml",
+            None,
+            None,
+        ),
+        (
+            InstallationChecksStorageConfig(run_config_name="rc", product_name="dqx"),
+            {"run_config_name": "rc2"},
+            "run_config_name",
+            "rc2",
+            "product_name",
+            "dqx",
+        ),
+    ],
+)
+def test_base_storage_config_replace_returns_new_same_type_with_overrides(
+    config, changes, changed_field, expected_value, preserved_field, preserved_value
+):
+    """`replace()` works for every storage-config subclass (incl. the diamond-inheritance
+    `InstallationChecksStorageConfig`): it returns a new instance of the same concrete type with the
+    override applied, other fields preserved, and the original (frozen) instance untouched."""
+    original_changed_value = getattr(config, changed_field)
+
+    replaced = config.replace(**changes)
+
+    assert replaced is not config
+    assert type(replaced) is type(config)
+    assert getattr(replaced, changed_field) == expected_value
+    assert getattr(config, changed_field) == original_changed_value  # original untouched
+    if preserved_field is not None:
+        assert getattr(replaced, preserved_field) == preserved_value
+
+
+# ---------------------------------------------------------------------------
+# ValidationError → InvalidConfigError wrapping (Task 4)
+# ---------------------------------------------------------------------------
+
+
+def test_base_checks_storage_config_wrong_type_raises_invalid_config_error() -> None:
+    """Constructing a BaseChecksStorageConfig subclass with a wrong-typed field must raise
+    InvalidConfigError, not the raw pydantic_core.ValidationError.  DQX callers should not
+    need to import pydantic to handle construction errors from config models.
+    """
+
+    class _StrictConfig(BaseChecksStorageConfig):
+        location: str = "test"
+        count: int  # int field — "not_a_number" cannot be coerced
+
+    with pytest.raises(InvalidConfigError):
+        _StrictConfig(location="test", count="not_a_number")  # type: ignore[arg-type]
+
+
+def test_storage_config_rejects_unknown_kwarg():
+    """Unknown/misspelled kwargs must be rejected, not silently dropped (extra='forbid').
+
+    Regression: the Pydantic migration defaulted to extra='ignore', so a typo was accepted
+    and dropped where the pre-migration dataclass raised TypeError.
+    """
+    with pytest.raises(InvalidConfigError):
+        FileChecksStorageConfig(location="/x/checks.yml", typo_field="oops")  # type: ignore[call-arg]
+
+
+# (location, matches_table_pattern, matches_uc_table_pattern) — one row per case so the two
+# patterns are pinned against the same inputs and their difference (the optional vs required
+# catalog part) stays visible.
+_TABLE_IDENTIFIER_CASES = [
+    # Three-level names: both patterns match.
+    ("catalog.schema.table", True, True),
+    ("cat_1.sch_2.tbl_3", True, True),
+    ("`my-catalog`.schema.table", True, True),  # backtick-quoted catalog with special chars
+    ("catalog.`my-schema`.`my-table`", True, True),
+    ("`my-catalog`.`my-schema`.`my-table`", True, True),
+    ("`weird.name`.schema.table", True, True),  # dot inside a backtick-quoted identifier
+    ("1abc.2def.3ghi", True, True),  # leading digits allowed in unquoted identifiers
+    # Two-level names: TABLE_PATTERN matches (catalog optional), UC_TABLE_PATTERN rejects (catalog required).
+    ("schema.table", True, False),
+    ("`my-schema`.table", True, False),
+    ("default.users", True, False),
+    # Non-table locations: neither matches.
+    ("users", False, False),  # bare name / temporary view
+    ("temp_from_dataframe_1_abcdef", False, False),
+    ("catalog.schema.table.extra", False, False),  # four-level name
+    ("`bad`catalog.schema.table", False, False),  # backticks not spanning the whole segment
+    ("/Volumes/main/default/data", False, False),  # storage path
+    ("s3://bucket/path", False, False),  # storage path
+    ("", False, False),
+]
+
+
+@pytest.mark.parametrize("location, matches_table, _matches_uc", _TABLE_IDENTIFIER_CASES)
+def test_table_pattern(location: str, matches_table: bool, _matches_uc: bool):
+    assert bool(TABLE_PATTERN.match(location)) == matches_table
+
+
+@pytest.mark.parametrize("location, _matches_table, matches_uc", _TABLE_IDENTIFIER_CASES)
+def test_uc_table_pattern(location: str, _matches_table: bool, matches_uc: bool):
+    assert bool(UC_TABLE_PATTERN.match(location)) == matches_uc
+
+
+def test_uc_table_pattern_is_stricter_than_table_pattern():
+    """UC_TABLE_PATTERN requires the catalog part, so it only ever accepts a subset of TABLE_PATTERN."""
+    for location, matches_table, matches_uc in _TABLE_IDENTIFIER_CASES:
+        if matches_uc:
+            assert matches_table, f"{location!r} matches UC_TABLE_PATTERN but not TABLE_PATTERN"

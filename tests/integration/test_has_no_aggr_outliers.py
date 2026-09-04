@@ -11,7 +11,7 @@ Test matrix
 3.  test_warmup_passes                      – only 3 days of history → pass (warmup)
 4.  test_constant_series_passes             – all identical values → sigma==0 → pass
 5.  test_null_current_passes                – most-recent bucket missing → pass
-6.  test_group_by_isolates_bands            – two groups, one spikes, one flat
+6.  test_group_by_isolates_bands            – two groups, including NULL, one spikes, one flat
 7.  test_row_filter                         – junk rows excluded before baseline
 8.  test_hour_truncation                    – time_interval="hour"
 9.  test_yaml_round_trip                    – load check from YAML via DQEngine
@@ -221,24 +221,29 @@ def test_null_current_passes(spark: SparkSession):
 # ---------------------------------------------------------------------------
 
 
-def test_group_by_isolates_bands(spark: SparkSession):
+@pytest.mark.parametrize("spike_group", ["spike", None])
+@pytest.mark.parametrize("group_column", ["grp", "__dq_metric"])
+def test_group_by_isolates_bands(spark: SparkSession, spike_group: str | None, group_column: str):
     """
-    Two groups: 'stable' (14 days at 10 +/- 1, today=10) and 'spike' (14 days
-    at 10 +/- 1, today=50). Only the 'spike' group should violate.
+    Two groups: 'stable' (14 days at 10 +/- 1, today=10) and a nullable spike
+    group (14 days at 10 +/- 1, today=50). Only the spike group should violate,
+    including when its column name matches an internal column prefix.
     """
     hist_values = [9.0, 11.0] * 7  # mean=10, stddev_pop=1.0
 
-    rows = []
+    rows: list[tuple[str | None, date, float]] = []
     for i, value in enumerate(hist_values):
         event_date = BASE_DATE + timedelta(days=i)
         rows.append(("stable", event_date, value))
-        rows.append(("spike", event_date, value))
+        rows.append((spike_group, event_date, value))
 
     today = BASE_DATE + timedelta(days=14)
     rows.append(("stable", today, 10.0))  # within band
-    rows.append(("spike", today, 50.0))  # spike
+    rows.append((spike_group, today, 50.0))  # spike
 
-    df = spark.createDataFrame(rows, "grp: string, event_date: date, metric: double")
+    df = spark.createDataFrame(rows, "grp: string, event_date: date, metric: double").withColumnRenamed(
+        "grp", group_column
+    )
 
     condition, apply_fn = has_no_aggr_outliers(
         "metric",
@@ -247,12 +252,12 @@ def test_group_by_isolates_bands(spark: SparkSession):
         sigma=3.0,
         lookback_num_intervals=14,
         warmup_num_intervals=3,
-        group_by=["grp"],
+        group_by=[group_column],
     )
     result = _apply_with_original(df, [(condition, apply_fn)])
 
-    stable_msgs = [r[-1] for r in result.filter(F.col("grp") == "stable").collect()]
-    spike_msgs = [r[-1] for r in result.filter(F.col("grp") == "spike").collect()]
+    stable_msgs = [r[-1] for r in result.filter(F.col(group_column) == "stable").collect()]
+    spike_msgs = [r[-1] for r in result.filter(F.col(group_column).eqNullSafe(F.lit(spike_group))).collect()]
 
     assert all(m is None for m in stable_msgs), f"Stable group should not violate: {stable_msgs}"
     assert all(m is not None for m in spike_msgs), f"Spike group should violate: {spike_msgs}"
@@ -452,6 +457,45 @@ def test_count_star_aggr_type(spark: SparkSession):
 
     msgs = [r[0] for r in result.collect()]
     assert any(m is not None for m in msgs), f"Expected count(*) spike to be detected but got: {msgs}"
+
+
+def test_count_star_aggr_type_with_row_filter(spark: SparkSession):
+    """Regression for #1435: column='*' with aggr_type='count' combined with a row_filter must not raise
+    INVALID_USAGE_OF_STAR_OR_REGEX. Only GOOD rows are counted per bucket; today's GOOD-row count spike fires.
+    """
+    rows = []
+    for i in range(14):
+        event_date = BASE_DATE + timedelta(days=i)
+        # Alternate 4 and 6 GOOD rows per day so stddev_pop > 0 and the constant-series guard does not fire.
+        for _ in range(4 if i % 2 == 0 else 6):
+            rows.append((event_date, "GOOD"))
+        # Noise rows excluded by the row_filter - they must not affect the per-bucket counts.
+        for _ in range(20):
+            rows.append((event_date, "JUNK"))
+
+    # Today: 100 GOOD rows (spike) plus filtered-out noise.
+    today = BASE_DATE + timedelta(days=14)
+    for _ in range(100):
+        rows.append((today, "GOOD"))
+    for _ in range(5):
+        rows.append((today, "JUNK"))
+
+    df = spark.createDataFrame(rows, "event_date: date, status: string")
+
+    condition, apply_fn = has_no_aggr_outliers(
+        "*",
+        "event_date",
+        aggr_type="count",
+        sigma=3.0,
+        lookback_num_intervals=14,
+        warmup_num_intervals=3,
+        row_filter="status = 'GOOD'",
+    )
+    result = apply_fn(df).select(condition)
+
+    msgs = [r[0] for r in result.collect()]
+    # The check must apply (no INVALID_USAGE_OF_STAR_OR_REGEX) and detect the GOOD-row count spike.
+    assert any(m is not None for m in msgs), f"Expected count(*) spike with row_filter but got: {msgs}"
 
 
 # ---------------------------------------------------------------------------

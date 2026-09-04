@@ -26,8 +26,6 @@ SCRAM handshake, real token rotation) is covered by integration tests
 that run against a live Lakebase instance — out of scope here.
 """
 
-from __future__ import annotations
-
 import datetime as dt
 import logging
 import threading
@@ -44,8 +42,7 @@ from databricks_labs_dqx_app.backend.pg_executor import (
     _TokenHolder,
     build_pg_executor,
 )
-from databricks_labs_dqx_app.backend.sql_executor import RawSql
-
+from databricks_labs_dqx_app.backend.sql_executor import RawSql, WhereIn
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,7 +53,7 @@ def _make_pg_executor(
     *,
     schema: str = "public",
     database: str = "dqx",
-    instance_name: str = "test-instance",
+    endpoint: str = "projects/test/branches/dev/endpoints/primary",
     token_refresh_seconds: int = 0,
     token_refresh_retry_seconds: int = 10,
     token_refresh_retry_jitter: float = 0.3,
@@ -85,7 +82,7 @@ def _make_pg_executor(
     The returned instance has the minimum attribute surface every
     method under test reads:
 
-    - ``_ws`` / ``_instance_name`` — used by the refresh loop and by
+    - ``_ws`` / ``_endpoint`` — used by the refresh loop and by
       :func:`build_pg_executor` smoke tests.
     - ``_schema`` / ``_database`` — used by ``schema`` / ``database`` /
       ``fqn`` / ``catalog`` properties.
@@ -105,7 +102,7 @@ def _make_pg_executor(
     """
     inst = PgExecutor.__new__(PgExecutor)
     inst._ws = MagicMock(name="WorkspaceClient")
-    inst._instance_name = instance_name
+    inst._endpoint = endpoint
     inst._database = database
     inst._schema = schema
     inst._username = "test-user"
@@ -461,6 +458,132 @@ class TestUpsertSqlShape:
 
 
 # ===========================================================================
+# CRUD-builder shortcuts — Postgres flavouring
+# ===========================================================================
+#
+# The dialect-agnostic behaviour of :func:`_build_insert` /
+# :func:`_build_update` / :func:`_build_delete` / :func:`_build_count`
+# is covered by ``test_sql_executor.py::TestBuild*``. These tests
+# lock in the Postgres-specific plumbing: ANSI double-quote
+# identifier quoting, and the ``current_timestamp()`` → ``CURRENT_TIMESTAMP``
+# translation that :func:`_pg_render_value` performs.
+
+
+class TestPgCrudBuilders:
+    """Ensures Postgres identifier quoting + value translation on the CRUD helpers."""
+
+    def _capture(self, executor: PgExecutor) -> list[str]:
+        captured: list[str] = []
+        executor.execute = lambda sql, **_: captured.append(sql)  # type: ignore[method-assign]
+        return captured
+
+    def test_insert_uses_ansi_quotes(self) -> None:
+        executor = _make_pg_executor()
+        captured = self._capture(executor)
+        executor.insert('"dq"."settings"', values={"key": "flag", "value": "on"})
+        assert captured == ['INSERT INTO "dq"."settings" ("key", "value") VALUES (\'flag\', \'on\')']
+
+    def test_insert_translates_current_timestamp_via_pg_render(self) -> None:
+        """The Spark idiom ``current_timestamp()`` must not appear in Postgres output."""
+        executor = _make_pg_executor()
+        captured = self._capture(executor)
+        executor.insert(
+            '"dq"."t"',
+            values={"id": "abc", "created_at": RawSql("current_timestamp()")},
+        )
+        sql = captured[0]
+        assert "current_timestamp()" not in sql
+        assert "CURRENT_TIMESTAMP" in sql
+
+    def test_update_uses_ansi_quotes(self) -> None:
+        executor = _make_pg_executor()
+        captured = self._capture(executor)
+        executor.update(
+            '"dq"."t"',
+            updates={"status": "approved"},
+            where={"id": "row-1"},
+        )
+        assert captured == ['UPDATE "dq"."t" SET "status" = \'approved\' WHERE "id" = \'row-1\'']
+
+    def test_update_reserved_word_column_is_quoted(self) -> None:
+        """Reserved words like ``check`` survive because we route through :meth:`q`."""
+        executor = _make_pg_executor()
+        captured = self._capture(executor)
+        executor.update(
+            '"dq"."t"',
+            updates={"check": "1"},
+            where={"order": "asc"},
+        )
+        sql = captured[0]
+        assert '"check" = \'1\'' in sql
+        assert '"order" = \'asc\'' in sql
+
+    def test_update_translates_current_timestamp(self) -> None:
+        """UPDATE ... SET updated_at = current_timestamp() → CURRENT_TIMESTAMP."""
+        executor = _make_pg_executor()
+        captured = self._capture(executor)
+        executor.update(
+            '"dq"."t"',
+            updates={"updated_at": RawSql("current_timestamp()")},
+            where={"id": "row-1"},
+        )
+        sql = captured[0]
+        assert "current_timestamp()" not in sql
+        assert '"updated_at" = CURRENT_TIMESTAMP' in sql
+
+    def test_delete_uses_ansi_quotes(self) -> None:
+        executor = _make_pg_executor()
+        captured = self._capture(executor)
+        executor.delete('"dq"."t"', where={"id": "row-1"})
+        assert captured == ['DELETE FROM "dq"."t" WHERE "id" = \'row-1\'']
+
+    def test_delete_wherein_bulk(self) -> None:
+        executor = _make_pg_executor()
+        captured = self._capture(executor)
+        executor.delete('"dq"."t"', where={"rule_id": WhereIn(["r1", "r2", "r3"])})
+        assert captured == ['DELETE FROM "dq"."t" WHERE "rule_id" IN (\'r1\', \'r2\', \'r3\')']
+
+    def test_count_no_where(self) -> None:
+        executor = _make_pg_executor()
+        executor.query = MagicMock(return_value=[["7"]])  # type: ignore[method-assign]
+        assert executor.count('"dq"."t"') == 7
+        assert executor.query.call_args.args[0] == 'SELECT COUNT(*) FROM "dq"."t"'
+
+    def test_count_with_where(self) -> None:
+        executor = _make_pg_executor()
+        executor.query = MagicMock(return_value=[["3"]])  # type: ignore[method-assign]
+        assert executor.count('"dq"."t"', where={"status": "active"}) == 3
+        assert executor.query.call_args.args[0] == 'SELECT COUNT(*) FROM "dq"."t" WHERE "status" = \'active\''
+
+    def test_select_rows_uses_ansi_quotes(self) -> None:
+        executor = _make_pg_executor()
+        executor.query = MagicMock(return_value=[["r1"]])  # type: ignore[method-assign]
+        rows = executor.select_rows('"dq"."t"', ["rule_id"], where={"is_builtin": True})
+        assert rows == [["r1"]]
+        assert executor.query.call_args.args[0] == 'SELECT "rule_id" FROM "dq"."t" WHERE "is_builtin" = TRUE'
+
+    def test_select_dicts_delegates_to_query_dicts(self) -> None:
+        executor = _make_pg_executor()
+        executor.query_dicts = MagicMock(return_value=[{"rule_id": "r1"}])  # type: ignore[method-assign]
+        rows = executor.select_dicts('"dq"."t"', ["rule_id", "embedding"])
+        assert rows == [{"rule_id": "r1"}]
+        assert executor.query_dicts.call_args.args[0] == 'SELECT "rule_id", "embedding" FROM "dq"."t"'
+
+    def test_update_refuses_empty_where(self) -> None:
+        """Full-table UPDATE is refused on Postgres too — the guard is dialect-agnostic."""
+        executor = _make_pg_executor()
+        self._capture(executor)
+        with pytest.raises(ValueError, match="WHERE clause required"):
+            executor.update('"dq"."t"', updates={"status": "done"}, where={})
+
+    def test_delete_refuses_empty_where(self) -> None:
+        executor = _make_pg_executor()
+        self._capture(executor)
+        with pytest.raises(ValueError, match="WHERE clause required"):
+            executor.delete('"dq"."t"', where={})
+
+
+# ===========================================================================
 # upsert_with_audit — Protocol method that absorbs the dialect branch
 # ===========================================================================
 
@@ -476,8 +599,10 @@ class TestUpsertWithAuditSqlShape:
        the DO UPDATE SET clause so the original creator/timestamp
        survive after the first INSERT.
     2. ``increment_on_update`` rewrites the named column's DO UPDATE
-       expression to ``col = col + 1`` (bare reference, which Postgres
-       resolves to the existing row inside ON CONFLICT DO UPDATE).
+       expression to ``col = <alias>.col + 1``, where ``<alias>`` is the
+       conflict target aliased via ``INSERT INTO <fqn> AS <alias>`` so the
+       reference resolves to the existing row (not EXCLUDED) without a
+       schema-qualified reference that Postgres would reject.
 
     These tests pin the rendered SQL so a regression to the old
     "include every value_cols in DO UPDATE" shape would fail loudly.
@@ -518,8 +643,12 @@ class TestUpsertWithAuditSqlShape:
         assert '"created_by"' not in set_clause
         assert '"created_at"' not in set_clause
 
-    def test_increment_on_update_uses_bare_column_self_reference(self) -> None:
-        """On Postgres, ``col + 1`` inside DO UPDATE resolves to the existing row."""
+    def test_increment_on_update_uses_aliased_self_reference(self) -> None:
+        """On Postgres, ``col + 1`` inside DO UPDATE must reference the
+        aliased conflict target — Lakebase rejects the bare form as
+        ambiguous when the same column also appears in ``EXCLUDED``, and
+        rejects a schema-qualified reference outright as an invalid
+        FROM-clause entry."""
         executor = _make_pg_executor()
         captured = self._capture(executor)
 
@@ -537,14 +666,24 @@ class TestUpsertWithAuditSqlShape:
         )
 
         sql = captured[0]
+        # The conflict target is aliased so the increment can address the
+        # existing row unambiguously.
+        assert 'INSERT INTO "dq"."dq_schedule_config" AS "dqx_upsert_target"' in sql
         # INSERT VALUES include the literal initial 1 (not the increment expr).
         assert "VALUES ('main', '{\"k\":\"v\"}', 1, 'alice@x', CURRENT_TIMESTAMP)" in sql
-        # DO UPDATE rewrites version to the bare-column self-reference
-        # — no table prefix, no EXCLUDED reference.
-        assert '"version" = "version" + 1' in sql
+        # DO UPDATE references the alias so the planner picks the existing
+        # row (not EXCLUDED).
+        assert '"version" = "dqx_upsert_target"."version" + 1' in sql
         # And specifically NOT the EXCLUDED form (which would set it to
         # the proposed 1 every time, defeating the increment).
         assert '"version" = EXCLUDED."version"' not in sql
+        # Regression guard: the bare-column form is what triggered the
+        # Lakebase "column reference is ambiguous" error in production.
+        assert '"version" = "version" + 1' not in sql
+        # Regression guard: a schema-qualified reference is an invalid
+        # existing-row reference inside DO UPDATE SET and would error on
+        # the FIRST save, not just on conflict.
+        assert '"version" = "dq"."dq_schedule_config"."version" + 1' not in sql
 
     def test_combined_preserve_created_and_increment_for_schedule_config_shape(self) -> None:
         """The exact call ``ScheduleConfigService.save`` makes — locked
@@ -577,7 +716,7 @@ class TestUpsertWithAuditSqlShape:
         assert '"config_json"' in set_clause
         assert '"updated_by"' in set_clause
         assert '"updated_at"' in set_clause
-        assert '"version" = "version" + 1' in set_clause
+        assert '"version" = "dqx_upsert_target"."version" + 1' in set_clause
 
     def test_all_value_cols_are_created_renders_do_nothing(self) -> None:
         """Edge case: insert-only audit row with no updatable cols."""
@@ -626,8 +765,11 @@ class TestUpsertWithAuditSqlShape:
             increment_on_update="order",
         )
         sql = captured[0]
-        # Increment must use quoted identifier on BOTH sides of the +.
-        assert '"order" = "order" + 1' in sql
+        # Increment must use quoted identifier on the LHS and the
+        # alias-qualified form on the RHS so EXCLUDED.<col> can't
+        # shadow the existing row. The bare ``t`` target is aliased.
+        assert 'INSERT INTO t AS "dqx_upsert_target"' in sql
+        assert '"order" = "dqx_upsert_target"."order" + 1' in sql
 
 
 # ===========================================================================
@@ -754,7 +896,7 @@ class TestTokenRefreshLoop:
         ) as gen:
             executor._token_refresh_loop()
 
-        gen.assert_called_with(executor._ws, executor._instance_name)
+        gen.assert_called_with(executor._ws, executor._endpoint)
         assert executor._token_holder.token == "fresh-token"
         assert executor._connect_kwargs["password"] == "fresh-token"
         # Success path updates the observability surface that the
@@ -960,7 +1102,7 @@ class TestRefreshFailureEscalation:
 
         ``os._exit`` is patched out so the test runs synchronously.
         """
-        executor = _make_pg_executor(instance_name="lakebase-prod-us-east-1")
+        executor = _make_pg_executor(endpoint="lakebase-prod-us-east-1")
         executor._consecutive_refresh_failures = 12
         before = executor._last_successful_refresh_at
 
@@ -1139,7 +1281,7 @@ class TestRefreshObservability:
             Pool.check_connection = MagicMock()
             executor = PgExecutor(
                 ws=MagicMock(),
-                instance_name="instance",
+                endpoint="instance",
                 database="dqx",
                 schema="public",
                 username="sp",
@@ -1212,7 +1354,7 @@ class TestRefreshTuningClamps:
         ):
             executor = PgExecutor(
                 ws=MagicMock(),
-                instance_name="i",
+                endpoint="i",
                 database="d",
                 schema="s",
                 username="u",
@@ -1232,7 +1374,7 @@ class TestRefreshTuningClamps:
         ):
             high = PgExecutor(
                 ws=MagicMock(),
-                instance_name="i",
+                endpoint="i",
                 database="d",
                 schema="s",
                 username="u",
@@ -1241,7 +1383,7 @@ class TestRefreshTuningClamps:
             )
             low = PgExecutor(
                 ws=MagicMock(),
-                instance_name="i",
+                endpoint="i",
                 database="d",
                 schema="s",
                 username="u",
@@ -1263,7 +1405,7 @@ class TestRefreshTuningClamps:
         ):
             executor = PgExecutor(
                 ws=MagicMock(),
-                instance_name="i",
+                endpoint="i",
                 database="d",
                 schema="s",
                 username="u",
@@ -1283,15 +1425,21 @@ class TestRefreshTuningClamps:
 class TestBuildPgExecutor:
     """Cover the two early-validation RuntimeErrors at lines 436-444."""
 
-    def test_raises_when_instance_has_no_read_write_dns(self) -> None:
-        ws = MagicMock(name="WorkspaceClient")
-        # get_database_instance returns an object whose .read_write_dns is empty.
-        ws.database.get_database_instance.return_value = MagicMock(read_write_dns=None)
+    @staticmethod
+    def _endpoint_with_host(host: str | None) -> MagicMock:
+        """Shape a ``get_endpoint`` return so ``status.hosts.host`` == *host*."""
+        hosts = MagicMock(host=host)
+        return MagicMock(status=MagicMock(hosts=hosts))
 
-        with pytest.raises(RuntimeError, match="has no read_write_dns"):
+    def test_raises_when_endpoint_has_no_host(self) -> None:
+        ws = MagicMock(name="WorkspaceClient")
+        # get_endpoint returns an endpoint whose status.hosts.host is empty.
+        ws.postgres.get_endpoint.return_value = self._endpoint_with_host(None)
+
+        with pytest.raises(RuntimeError, match="has no read/write host"):
             build_pg_executor(
                 ws,
-                instance_name="missing-dns-instance",
+                endpoint="projects/dqx/branches/dev/endpoints/primary",
                 database="dqx",
                 schema="dqx_studio",
             )
@@ -1300,7 +1448,7 @@ class TestBuildPgExecutor:
 
     def test_raises_when_calling_identity_has_no_username_or_id(self) -> None:
         ws = MagicMock(name="WorkspaceClient")
-        ws.database.get_database_instance.return_value = MagicMock(read_write_dns="some.host:5432")
+        ws.postgres.get_endpoint.return_value = self._endpoint_with_host("some.host:5432")
         # Both user_name AND id come back falsy — Lakebase has nothing
         # to authenticate as.
         ws.current_user.me.return_value = MagicMock(user_name=None, id=None)
@@ -1308,7 +1456,7 @@ class TestBuildPgExecutor:
         with pytest.raises(RuntimeError, match="Could not determine workspace identity"):
             build_pg_executor(
                 ws,
-                instance_name="ok-instance",
+                endpoint="projects/dqx/branches/dev/endpoints/primary",
                 database="dqx",
                 schema="dqx_studio",
             )
@@ -1316,7 +1464,7 @@ class TestBuildPgExecutor:
     def test_uses_id_as_fallback_when_user_name_is_empty(self) -> None:
         """``me.user_name or me.id`` fallback — proves we don't bail on user_name=None alone."""
         ws = MagicMock(name="WorkspaceClient")
-        ws.database.get_database_instance.return_value = MagicMock(read_write_dns="ok.host")
+        ws.postgres.get_endpoint.return_value = self._endpoint_with_host("ok.host")
         ws.current_user.me.return_value = MagicMock(user_name=None, id="sp-1234")
 
         # We stop before the real PgExecutor opens its pool — patch
@@ -1328,7 +1476,7 @@ class TestBuildPgExecutor:
         ) as init_mock:
             build_pg_executor(
                 ws,
-                instance_name="ok-instance",
+                endpoint="projects/dqx/branches/dev/endpoints/primary",
                 database="dqx",
                 schema="dqx_studio",
             )
@@ -1338,7 +1486,7 @@ class TestBuildPgExecutor:
         kwargs = init_mock.call_args.kwargs
         assert kwargs["username"] == "sp-1234", "fell through user_name=None to id"
         assert kwargs["host"] == "ok.host"
-        assert kwargs["instance_name"] == "ok-instance"
+        assert kwargs["endpoint"] == "projects/dqx/branches/dev/endpoints/primary"
 
 
 # ===========================================================================
@@ -1647,20 +1795,19 @@ class TestTokenHolder:
 
 
 class TestGenerateToken:
-    """Thin wrapper around ``ws.database.generate_database_credential``."""
+    """Thin wrapper around ``ws.postgres.generate_database_credential``."""
 
     def test_returns_token_from_credential_response(self) -> None:
         ws = MagicMock(name="WorkspaceClient")
-        ws.database.generate_database_credential.return_value = MagicMock(token="fresh-tok")
-        assert _generate_token(ws, "my-instance") == "fresh-tok"
-        # Request ID should be a UUID-shaped string and instance_names a single-item list.
-        call_kwargs = ws.database.generate_database_credential.call_args.kwargs
-        assert call_kwargs["instance_names"] == ["my-instance"]
-        assert isinstance(call_kwargs["request_id"], str)
-        assert len(call_kwargs["request_id"]) >= 32
+        ws.postgres.generate_database_credential.return_value = MagicMock(token="fresh-tok")
+        endpoint = "projects/dqx/branches/dqx/endpoints/primary"
+        assert _generate_token(ws, endpoint) == "fresh-tok"
+        # Credential issuance is endpoint-scoped (Lakebase projects model).
+        call_kwargs = ws.postgres.generate_database_credential.call_args.kwargs
+        assert call_kwargs["endpoint"] == endpoint
 
     def test_raises_when_credential_response_has_no_token(self) -> None:
         ws = MagicMock(name="WorkspaceClient")
-        ws.database.generate_database_credential.return_value = MagicMock(token=None)
+        ws.postgres.generate_database_credential.return_value = MagicMock(token=None)
         with pytest.raises(RuntimeError, match="no token"):
-            _generate_token(ws, "my-instance")
+            _generate_token(ws, "projects/dqx/branches/dqx/endpoints/primary")

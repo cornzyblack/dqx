@@ -1,8 +1,27 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Loader2, MessageSquare, Send, Trash2 } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { formatDateTime } from "@/lib/format-utils";
+import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -13,18 +32,36 @@ import {
   type CommentOut,
 } from "@/lib/api-custom";
 
+// Comment threads are keyed by a generic (entity_type, entity_id) pair on the
+// backend, so the union here just mirrors the backend allowlist. `rule` keys
+// on rule_id, `monitored_table` on binding_id, `data_product` on product_id,
+// `run` on run_id.
+export type CommentEntityType = "run" | "rule" | "monitored_table" | "data_product";
+
 interface CommentThreadProps {
-  entityType: "run" | "rule";
+  entityType: CommentEntityType;
   entityId: string;
+  // When embedded (e.g. inside a dialog), the thread renders always-open with
+  // no collapse toggle and drops the inline left rule/indent used on list rows.
+  embedded?: boolean;
 }
 
-export function CommentThread({ entityType, entityId }: CommentThreadProps) {
+export function CommentThread({ entityType, entityId, embedded = false }: CommentThreadProps) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [newComment, setNewComment] = useState("");
   const [isOpen, setIsOpen] = useState(false);
+  // Deletion is destructive — gate it behind a confirm dialog so an
+  // accidental click on the trash icon (which appears on hover) doesn't
+  // silently nuke a comment.
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+
+  // Embedded threads are open by design; the query only fires once open so a
+  // collapsed thread on a list row stays cheap.
+  const open = embedded || isOpen;
 
   const { data: commentsResp, isLoading } = useListComments(entityType, entityId, {
-    query: { enabled: isOpen },
+    query: { enabled: open },
   });
   const comments: CommentOut[] = commentsResp?.data ?? [];
 
@@ -40,7 +77,7 @@ export function CommentThread({ entityType, entityId }: CommentThreadProps) {
       setNewComment("");
       queryClient.invalidateQueries({ queryKey: getListCommentsQueryKey(entityType, entityId) });
     } catch {
-      toast.error("Failed to add comment");
+      toast.error(t("commentThread.failedAdd"));
     }
   };
 
@@ -49,35 +86,39 @@ export function CommentThread({ entityType, entityId }: CommentThreadProps) {
       await deleteMutation.mutateAsync({ commentId });
       queryClient.invalidateQueries({ queryKey: getListCommentsQueryKey(entityType, entityId) });
     } catch {
-      toast.error("Failed to delete comment");
+      toast.error(t("commentThread.failedDelete"));
+    } finally {
+      setPendingDeleteId(null);
     }
   };
 
   return (
     <div className="space-y-3">
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        aria-expanded={isOpen}
-        className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <MessageSquare className="h-4 w-4" />
-        <span>
-          {isOpen ? "Hide" : "Show"} comments
-          {comments.length > 0 && ` (${comments.length})`}
-        </span>
-      </button>
+      {!embedded && (
+        <button
+          onClick={() => setIsOpen(!isOpen)}
+          aria-expanded={isOpen}
+          className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
+        >
+          <MessageSquare className="h-4 w-4" />
+          <span>
+            {isOpen ? t("commentThread.hideComments") : t("commentThread.showComments")} {t("commentThread.commentsSuffix")}
+            {comments.length > 0 && ` (${comments.length})`}
+          </span>
+        </button>
+      )}
 
-      {isOpen && (
-        <div className="space-y-3 pl-6 border-l-2 border-muted">
+      {open && (
+        <div className={cn("space-y-3", !embedded && "pl-6 border-l-2 border-muted")}>
           {isLoading && (
             <div className="flex items-center gap-2 text-muted-foreground text-xs py-2">
               <Loader2 className="h-3 w-3 animate-spin" />
-              Loading comments...
+              {t("commentThread.loading")}
             </div>
           )}
 
           {!isLoading && comments.length === 0 && (
-            <p className="text-xs text-muted-foreground py-1">No comments yet.</p>
+            <p className="text-xs text-muted-foreground py-1">{t("commentThread.empty")}</p>
           )}
 
           {comments.map((c) => (
@@ -93,8 +134,9 @@ export function CommentThread({ entityType, entityId }: CommentThreadProps) {
                   variant="ghost"
                   size="sm"
                   className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 transition-opacity"
-                  onClick={() => handleDelete(c.comment_id)}
+                  onClick={() => setPendingDeleteId(c.comment_id)}
                   disabled={deleteMutation.isPending}
+                  aria-label={t("commentThread.deleteAria")}
                 >
                   <Trash2 className="h-3 w-3 text-muted-foreground" />
                 </Button>
@@ -104,15 +146,6 @@ export function CommentThread({ entityType, entityId }: CommentThreadProps) {
           ))}
 
           <div className="flex items-start gap-2">
-            <Textarea
-              value={newComment}
-              onChange={(e) => setNewComment(e.target.value)}
-              placeholder="Add a comment..."
-              className="text-sm min-h-[60px] flex-1"
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleAdd();
-              }}
-            />
             <Button
               size="sm"
               onClick={handleAdd}
@@ -125,9 +158,81 @@ export function CommentThread({ entityType, entityId }: CommentThreadProps) {
                 <Send className="h-3.5 w-3.5" />
               )}
             </Button>
+            <Textarea
+              value={newComment}
+              onChange={(e) => setNewComment(e.target.value)}
+              placeholder={t("commentThread.placeholder")}
+              className="text-sm min-h-[60px] flex-1"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleAdd();
+              }}
+            />
           </div>
         </div>
       )}
+
+      <AlertDialog
+        open={pendingDeleteId !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteId(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("commentThread.deleteConfirmTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("commentThread.deleteConfirmBody")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (pendingDeleteId) void handleDelete(pendingDeleteId);
+              }}
+              disabled={deleteMutation.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleteMutation.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                t("common.delete")
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
+  );
+}
+
+/**
+ * Comment thread presented in a modal dialog — mounted from the 3-dot menu on
+ * the registry-rule, monitored-table, and table-space detail pages so comments
+ * live in a consistent place across governed objects.
+ */
+export function CommentsDialog({
+  entityType,
+  entityId,
+  open,
+  onOpenChange,
+}: {
+  entityType: CommentEntityType;
+  entityId: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{t("commentThread.dialogTitle")}</DialogTitle>
+          <DialogDescription>{t("commentThread.dialogDescription")}</DialogDescription>
+        </DialogHeader>
+        {/* Remount per open so the thread refetches and resets its composer. */}
+        {open && <CommentThread entityType={entityType} entityId={entityId} embedded />}
+      </DialogContent>
+    </Dialog>
   );
 }

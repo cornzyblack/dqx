@@ -1,0 +1,104 @@
+# MCP server integration tests.
+#
+# Runs the tests/integration_mcp suite via the shared acceptance harness (same workspace,
+# auth, and Model Serving endpoint as the anomaly/integration suites). The suite deploys an
+# isolated MCP app from the bundle, drives it as an agent would, and tears it down — see
+# tests/integration_mcp/conftest.py. No MCP-specific secrets are needed; auth comes from the
+# acceptance action exactly like the other integration workflows.
+name: mcp
+
+# Runs on every PR (no `paths:` filter), like the anomaly and acceptance suites: the MCP server
+# exercises the DQX library end-to-end, so a change anywhere in the library, its packaging, or the
+# shared test/CI plumbing can break it. Running always also means the `mcp` Codecov flag is uploaded
+# for every commit, so those files never drop out of a report for want of a carryforward rule.
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false # let teardown finish so the isolated app/bundle is removed
+
+jobs:
+  # Gate downstream work: fork PRs (no access to the tool environment) and drafts do not run.
+  not-a-fork:
+    runs-on:
+      group: databrickslabs-protected-runner-group
+      labels: linux-ubuntu-latest
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft && !github.event.pull_request.head.repo.fork
+    steps:
+      - run: echo "Not a fork PR, proceeding"
+
+  mcp-tests:
+    needs: not-a-fork
+    environment: tool
+    runs-on:
+      group: larger-runners
+      labels: larger
+    permissions:
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+
+      - name: Pre-build DQX wheel
+        uses: ./.github/actions/prebuild-wheel
+
+      # Coverage for this suite is collected REMOTELY, unlike the anomaly/integration suites whose
+      # code runs in the pytest process (databricks-connect): the server runs in a deployed
+      # Databricks App and the runner in a serverless job, so a test-only bootstrap wheel traces
+      # them there and ships the data back through a UC volume. The test downloads it before
+      # teardown; the steps after the test merge and upload it. See
+      # tests/integration_mcp/coverage_bootstrap/README.md.
+
+      # Required for the DAB (Databricks Asset Bundle) deploy the MCP suite runs (ci_deploy.sh).
+      # The CLI lands on PATH (via GITHUB_PATH) for the acceptance action's test subprocess.
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@596b0a354ba14aa59921aca1b02bd67c2b0a81a5 # v0.297.2
+
+      - name: Run MCP integration tests
+        uses: databrickslabs/sandbox/acceptance@83461e5dd7021feabb1a9ca3ee10d6f46b72092a # acceptance/v0.4.6
+        with:
+          vault_uri: ${{ secrets.VAULT_URI }}
+          timeout: 1h
+          codegen_path: tests/integration_mcp/.codegen.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          # No runner-SP env var is needed: ci_deploy.sh leaves the runner job's run_as at the
+          # *deploying identity* (resolved via `databricks current-user me`), so run_as == the job's
+          # creator and needs no servicePrincipal.user grant. A real deploy would instead pass a
+          # dedicated least-privilege SP via DQX_MCP_RUNNER_SERVICE_PRINCIPAL_ID.
+          #
+          # Opts this deploy into coverage collection: ci_deploy.sh picks the dev-coverage bundle
+          # target and installs the bootstrap wheel into the app, and the conftest downloads the
+          # data files. "1" means "enabled, derive the directory" (<results_volume>/coverage).
+          DQX_MCP_COVERAGE_DIR: "1"
+
+      - name: Merge remote coverage and convert to XML
+        # `always()`: publish whatever the run produced even when the test FAILED — that is exactly
+        # when the coverage (and the volume's data files) are most useful, and without it GitHub
+        # skips this step on failure and the run's data is lost. See the action for merge details.
+        if: always()
+        uses: ./.github/actions/merge-mcp-coverage
+
+      - name: Publish test coverage
+        # Also always(), for the same reason; the action tolerates a missing file.
+        if: always()
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
+        with:
+          use_oidc: true
+          files: coverage-combined.xml
+          flags: mcp

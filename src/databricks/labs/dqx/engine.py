@@ -2,15 +2,18 @@ import copy
 import inspect
 import logging
 import os
+import threading
+import re
+import sys
 from concurrent import futures
 from collections.abc import Callable
-from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import cached_property
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pyspark.sql.functions as F
+from pyspark.errors import AnalysisException
 from pyspark.sql import DataFrame, Observation, SparkSession
 from pyspark.sql.streaming import StreamingQuery
 
@@ -35,11 +38,15 @@ from databricks.labs.dqx.config import (
     BaseChecksStorageConfig,
     RunConfig,
     ExtraParams,
+    ActionEventsConfig,
+    TableActionsStorageConfig,
+    LakebaseActionsStorageConfig,
 )
 from databricks.labs.dqx.manager import DQRuleManager
 from databricks.labs.dqx.reporting_columns import ColumnArguments, DefaultColumnNames, merge_info_columns
 from databricks.labs.dqx.rule import (
     Criticality,
+    CHECK_FUNC_MIN_DBR_VERSION_ATTRIBUTE,
     DQRule,
     CHECK_FUNC_REGISTRY_ORIGINAL_COLUMNS_PRESELECTION,
 )
@@ -48,11 +55,27 @@ from databricks.labs.dqx.schema import dq_result_schema
 from databricks.labs.dqx.metrics_observer import DQMetricsObservation, DQMetricsObserver
 from databricks.labs.dqx.metrics_listener import StreamingMetricsListener
 from databricks.labs.dqx.io import read_input_data, save_dataframe_as_table, get_reference_dataframes
-from databricks.labs.dqx.telemetry import telemetry_logger, log_telemetry, log_dataframe_telemetry
+from databricks.labs.dqx.telemetry import telemetry_logger, log_telemetry, log_dataframe_telemetry, is_dlt_pipeline
 from databricks.sdk import WorkspaceClient
-from databricks.labs.dqx.errors import InvalidCheckError, InvalidConfigError, InvalidParameterError
+from databricks.labs.dqx.errors import (
+    InvalidCheckError,
+    InvalidConfigError,
+    InvalidParameterError,
+    TerminalActionError,
+)
 from databricks.labs.dqx.utils import list_tables, safe_strip_file_from_path, resolve_variables, VariableValue
 from databricks.labs.dqx.io import is_one_time_trigger
+from databricks.labs.dqx.actions.base import ActionContext, ActionResult, ActionServices
+from databricks.labs.dqx.actions.dq_action import DQAction
+from databricks.labs.dqx.actions.manager import DQActionManager
+from databricks.labs.dqx.actions.evaluator import ActionEvaluator
+from databricks.labs.dqx.actions.serializer import ActionSerializer
+from databricks.labs.dqx.actions.state import ActionStateStore
+from databricks.labs.dqx.actions.event_storage import ActionEventStoreFactory
+from databricks.labs.dqx.actions.secrets import SecretResolver
+from databricks.labs.dqx.actions.delivery import WebhookClient
+from databricks.labs.dqx.actions.log_sanitize import sanitize_for_log
+from databricks.labs.dqx.checks_semantic_validator import ChecksSemanticValidator, ChecksSemanticValidationMode
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +88,7 @@ class DQEngineCore(DQEngineCoreBase):
         spark: Optional SparkSession to use. If not provided, the active session is used.
         extra_params: Optional extra parameters for the engine, such as result column names and run metadata.
         observer: Optional DQMetricsObserver for tracking data quality summary metrics.
+        actions: Optional list of *DQAction* instances to evaluate after checks are applied.
     """
 
     def __init__(
@@ -73,6 +97,7 @@ class DQEngineCore(DQEngineCoreBase):
         spark: SparkSession | None = None,
         extra_params: ExtraParams | None = None,
         observer: DQMetricsObserver | None = None,
+        actions: list[DQAction] | None = None,
     ):
         super().__init__(workspace_client)
 
@@ -109,6 +134,12 @@ class DQEngineCore(DQEngineCoreBase):
         else:
             self.run_id = extra_params.run_id_overwrite or str(uuid4())  # auto-generate if not provided
 
+        self._actions = actions or []
+        # Stored for construction-time validation (see below) and reserved for lower-level use.
+        # Batch action evaluation is orchestrated by DQEngine, not DQEngineCore.
+        if self._actions and self.observer is None:
+            raise InvalidParameterError("Actions require a metrics observer; provide observer=...")
+
     @cached_property
     def result_column_names(self) -> dict[ColumnArguments, str]:
         return self._result_column_names
@@ -143,6 +174,8 @@ class DQEngineCore(DQEngineCoreBase):
             raise InvalidCheckError(
                 "All elements in the 'checks' list must be instances of DQRule. Use 'apply_checks_by_metadata' to pass checks as list of dicts instead."
             )
+
+        self._validate_dbr_version_requirements(checks)
 
         warning_checks = self._get_check_columns(checks, Criticality.WARN.value)
         error_checks = self._get_check_columns(checks, Criticality.ERROR.value)
@@ -285,7 +318,10 @@ class DQEngineCore(DQEngineCoreBase):
 
         good_df, bad_df, *observations = self.apply_checks_and_split(df, dq_rule_checks, ref_dfs)
 
-        if self.observer:
+        # An observation is only returned when observe() was actually wired (an observer is set and we
+        # are not inside a Spark Declarative Pipeline, where it is skipped). Key off the returned shape
+        # rather than self.observer so the SDP path (observer set, observe() skipped) does not raise.
+        if observations:
             return good_df, bad_df, observations[0]
 
         return good_df, bad_df
@@ -295,22 +331,43 @@ class DQEngineCore(DQEngineCoreBase):
         checks: list[dict],
         custom_check_functions: dict[str, Callable] | None = None,
         validate_custom_check_functions: bool = True,
+        semantic_validation_mode: str | None = ChecksSemanticValidationMode.WARN,
     ) -> ChecksValidationStatus:
         """
-        Validate checks defined as metadata to ensure they conform to the expected structure and types.
+        Validate checks defined as metadata to ensure they conform to the expected
+        structure and types, and are semantically consistent as a ruleset.
 
-        This method validates the presence of required keys, the existence and callability of functions,
-        and the types of arguments passed to those functions.
+        Structural validation checks for required keys, callable functions, and
+        correct argument types. Semantic validation detects duplicate rules and
+        similar rules with conflicting arguments (e.g. two is_in_range checks on
+        the same column with different thresholds).
+
+        Note:
+            Rules using raw Spark SQL expressions are not deeply inspected during
+            semantic validation — only structured metadata is compared.
 
         Args:
             checks: List of checks to apply to the DataFrame. Each check should be a dictionary.
-            custom_check_functions: Optional dictionary with custom check functions (e.g., *globals()* of the calling module).
+            custom_check_functions: Optional dictionary with custom check functions
+                (e.g., *globals()* of the calling module).
             validate_custom_check_functions: If True, validate custom check functions.
+            semantic_validation_mode: Controls how semantic issues are surfaced.
+                Use *ChecksSemanticValidationMode.WARN* (default) to log warnings,
+                *ChecksSemanticValidationMode.FAIL* to raise on any issue, or
+                *None* to skip semantic validation entirely.
 
         Returns:
-            ChecksValidationStatus indicating the validation result.
+            ChecksValidationStatus indicating the structural validation result.
+
+        Raises:
+            ValueError: If semantic_validation_mode is FAIL and issues are found.
         """
-        return ChecksValidator.validate_checks(checks, custom_check_functions, validate_custom_check_functions)
+        status = ChecksValidator.validate_checks(checks, custom_check_functions, validate_custom_check_functions)
+
+        if semantic_validation_mode is not None:
+            ChecksSemanticValidator.apply(checks, mode=semantic_validation_mode)
+
+        return status
 
     def get_invalid(self, df: DataFrame) -> DataFrame:
         """
@@ -391,6 +448,65 @@ class DQEngineCore(DQEngineCoreBase):
         """Check if all elements in the checks list are instances of DQRule."""
         return all(isinstance(check, DQRule) for check in checks)
 
+    def _validate_dbr_version_requirements(self, checks: list[DQRule]) -> None:
+        """Raise InvalidCheckError if the current Databricks Runtime version is below the version required by any check.
+
+        The requirement is declared by decorating a check function with *requires_dbr_version("major.minor")*.
+        The current DBR version is resolved via the *current_version().dbr_version* Spark SQL function and compared
+        as a *(major, minor)* tuple. The version string may carry a suffix (for example *"18.2.x-photon-scala2.13"*
+        on serverless or *"15.4 LTS"*); only the leading *major* and optional *minor* are used. A bare-major
+        serverless form such as *"17.x-photon-scala2.13"* has no numeric minor, so only the major is compared
+        (for example *"17.x"* satisfies a *"17.1"* requirement).
+
+        When the version cannot be determined - *current_version().dbr_version* returns null or empty - the
+        requirement is not enforced rather than blocking an environment that may well support the check.
+
+        Args:
+            checks: List of DQRule instances to validate.
+
+        Raises:
+            InvalidCheckError: If the current DBR version is below the maximum required version, if the
+                *current_version()* function is unavailable (non-Databricks environment), or if a non-empty
+                version string has no leading *major.minor* and cannot be parsed.
+        """
+        versioned = {
+            c.check_func.__name__: getattr(c.check_func, CHECK_FUNC_MIN_DBR_VERSION_ATTRIBUTE)
+            for c in checks
+            if getattr(c.check_func, CHECK_FUNC_MIN_DBR_VERSION_ATTRIBUTE, None) is not None
+        }
+
+        if not versioned:
+            return
+
+        required = max(versioned.values())
+        try:
+            rows = self.spark.sql("select current_version().dbr_version as dbr_version").collect()
+            dbr_version_str = rows[0]["dbr_version"] if rows else None
+        except AnalysisException as e:
+            raise InvalidCheckError(
+                "Check functions with a DBR version requirement can only run on Databricks Runtime. "
+                f"Failed to resolve the current DBR version: {e}"
+            ) from e
+
+        # When the version cannot be determined (null or empty), skip enforcement rather than blocking an
+        # environment that may well support the check.
+        if dbr_version_str is None or not dbr_version_str.strip():
+            return
+
+        match = re.match(r"\s*(\d+)(?:\.(\d+))?", dbr_version_str)
+        if match is None:
+            raise InvalidCheckError(f"Cannot parse Databricks Runtime version: '{dbr_version_str}'.")
+        minor = int(match.group(2)) if match.group(2) is not None else sys.maxsize
+        current = (int(match.group(1)), minor)
+
+        if current < required:
+            check_names = ", ".join(sorted(versioned))
+            required_str = f"{required[0]}.{required[1]}"
+            raise InvalidCheckError(
+                f"Check functions [{check_names}] require Databricks Runtime >= {required_str}, "
+                f"but the current version is {dbr_version_str}."
+            )
+
     def _preselect_original_columns(self, df: DataFrame, check: DQRule) -> DQRule:
         """
         Certain data quality checks (such as has_valid_schema) require access to the DataFrame's original schema—before
@@ -421,7 +537,7 @@ class DQEngineCore(DQEngineCoreBase):
         # preselect original columns
         rule_kwargs = check.check_func_kwargs.copy()
         rule_kwargs["columns"] = [col for col in df.columns if col not in set(self._result_column_names.values())]
-        return replace(check, check_func_kwargs=rule_kwargs)
+        return check.replace(check_func_kwargs=rule_kwargs)
 
     def _append_empty_checks(self, df: DataFrame) -> DataFrame:
         """Append empty checks at the end of DataFrame.
@@ -545,6 +661,19 @@ class DQEngineCore(DQEngineCoreBase):
         if not self.observer:
             return df
 
+        # Inside a Spark Declarative Pipeline (SDP / Lakeflow / DLT) the runtime — not the caller —
+        # triggers the write, so an attached observe() never has an accessible result (observation.get
+        # stalls, the streaming listener receives no events). Skip wiring observe() there: apply_checks*
+        # returns the DataFrame unchanged (no tuple, no wasted/inaccessible observation), and metrics are
+        # instead computed by DQEngine.compute_summary_metrics over the checked table. The engine's
+        # observer (incl. its custom_metrics) is still used by that method.
+        if is_dlt_pipeline(self.spark):
+            logger.warning(
+                "Spark Declarative Pipeline detected: observe()-based summary metrics are disabled. "
+                "Compute metrics with DQEngine.compute_summary_metrics(...) instead (e.g. in a materialized view or a foreachBatch sink)."
+            )
+            return df
+
         metric_exprs = [F.expr(m) for m in self.observer.get_metrics(check_names)]
         if not metric_exprs:
             return df
@@ -554,6 +683,16 @@ class DQEngineCore(DQEngineCoreBase):
             return df.observe(self.observer.id, *metric_exprs), observation
 
         return df.observe(observation, *metric_exprs), observation
+
+
+def _populate_batch_observation(
+    metrics_config: OutputConfig | None,
+    batch_observation: Observation | None,
+    metrics_only_df: DataFrame | None,
+) -> None:
+    """Force an action so the Observation is populated; otherwise Observation.get blocks in metrics-only mode."""
+    if metrics_config is not None and batch_observation is not None and metrics_only_df is not None:
+        metrics_only_df.count()
 
 
 class DQEngine(DQEngineBase):
@@ -571,6 +710,20 @@ class DQEngine(DQEngineBase):
             a default factory is created.
         config_serializer: Optional ConfigSerializer instance to use. If not provided, a new instance is created.
         observer: Optional DQMetricsObserver for tracking data quality summary metrics.
+        actions: Optional list of *DQAction* instances or raw action dicts to evaluate after checks
+            are applied in the batch path.  Dict entries are deserialized to *DQAction* via
+            *ActionSerializer.from_dict* at construction time; mixed lists are supported.
+            Requires an *observer* to be provided (actions need observed metrics to evaluate
+            conditions).  When provided without an *observer*, raises *InvalidParameterError* at
+            construction time.
+        action_evaluator_factory: Optional factory callable that receives the list of *DQAction* instances and
+            returns an *ActionEvaluator*. Used to inject a custom or test evaluator. When *None*, the default
+            factory builds a real *ActionEvaluator* with *ActionStateStore*, *SecretResolver*, and
+            *WebhookClient*.
+        action_events_config: Optional *ActionEventsConfig* (or *LakebaseActionsStorageConfig*) for a persistent
+            action-events table. When provided, the action state store is seeded from it on first use and every
+            fired action is appended to it, so frequency (*HOURLY* / *DAILY*) and *STATUS_CHANGE* suppression
+            survive engine restarts. When *None*, alert state is in-memory only for the engine's lifetime.
     """
 
     def __init__(
@@ -582,16 +735,29 @@ class DQEngine(DQEngineBase):
         checks_handler_factory: BaseChecksStorageHandlerFactory | None = None,
         config_serializer: ConfigSerializer | None = None,
         observer: DQMetricsObserver | None = None,
+        actions: list[DQAction | dict[str, object]] | None = None,
+        action_evaluator_factory: Callable[[list[DQAction]], ActionEvaluator] | None = None,
+        action_events_config: ActionEventsConfig | LakebaseActionsStorageConfig | None = None,
     ):
         super().__init__(workspace_client)
 
+        self._actions = [a if isinstance(a, DQAction) else ActionSerializer.from_dict(a) for a in (actions or [])]
+        if self._actions and observer is None:
+            raise InvalidParameterError("Actions require a metrics observer; construct DQEngine with observer=...")
+
         self._extra_params = extra_params or ExtraParams()
         self.spark = SparkSession.builder.getOrCreate() if spark is None else spark
-        self._engine = engine or DQEngineCore(workspace_client, spark, self._extra_params, observer)
+        self._engine = engine or DQEngineCore(workspace_client, spark, self._extra_params, observer, self._actions)
         self._config_serializer = config_serializer or ConfigSerializer(workspace_client)
         self._checks_handler_factory: BaseChecksStorageHandlerFactory = (
             checks_handler_factory or ChecksStorageHandlerFactory(self.ws, self.spark)
         )
+        self._action_evaluator_factory = action_evaluator_factory
+        # Optional persistent event store. When set, the action state store is seeded from it on
+        # first use so frequency / status-change suppression survives engine restarts.
+        self._action_events_config = action_events_config
+        self._action_evaluator: ActionEvaluator | None = None
+        self._action_evaluator_lock = threading.Lock()
 
     @telemetry_logger("engine", "apply_checks")
     def apply_checks(
@@ -694,11 +860,226 @@ class DQEngine(DQEngineBase):
             df=df, checks=checks, custom_check_functions=custom_check_functions, ref_dfs=ref_dfs
         )
 
+    def _get_action_evaluator(self) -> ActionEvaluator | None:
+        """Return the cached *ActionEvaluator*, building it on first call.
+
+        Returns *None* when no actions are configured (no-op path).
+        """
+        if not self._actions:
+            return None
+        # Double-checked locking: apply_checks_and_save_in_tables evaluates run configs on a thread
+        # pool, so without this lock each thread would build its own evaluator (and its own
+        # ActionStateStore), defeating frequency/status-change deduplication.
+        if self._action_evaluator is None:
+            with self._action_evaluator_lock:
+                if self._action_evaluator is None:
+                    if self._action_evaluator_factory is not None:
+                        self._action_evaluator = self._action_evaluator_factory(self._actions)
+                    else:
+                        self._action_evaluator = ActionEvaluator(
+                            self._actions,
+                            state_store=self._build_action_state_store(),
+                            services=ActionServices(
+                                secret_resolver=SecretResolver(self.ws),
+                                webhook_client=WebhookClient(),
+                                ws=self.ws,
+                                spark=self.spark,
+                            ),
+                        )
+        return self._action_evaluator
+
+    def _build_action_state_store(self) -> ActionStateStore:
+        """Build the action state store, backed by a persistent event store when configured.
+
+        When *action_events_config* is set, the store is seeded from the events table so that
+        frequency (*HOURLY* / *DAILY*) and *STATUS_CHANGE* suppression survive engine restarts;
+        otherwise an in-memory-only store is returned.
+        """
+        if self._action_events_config is None:
+            return ActionStateStore()
+        event_store = ActionEventStoreFactory.create(self._action_events_config, self.spark, self.ws)
+        state_store = ActionStateStore(event_store=event_store)
+        state_store.seed()
+        return state_store
+
+    @telemetry_logger("engine", "evaluate_actions")
+    def evaluate_actions(
+        self,
+        observed_metrics: dict[str, object],
+        *,
+        input_location: str | None = None,
+        output_location: str | None = None,
+        quarantine_location: str | None = None,
+        checks_location: str | None = None,
+        rule_set_fingerprint: str | None = None,
+    ) -> list[ActionResult]:
+        """Evaluate all configured actions against the observed metrics from the latest batch run.
+
+        Builds an *ActionContext* from *observed_metrics* plus the engine's run metadata and
+        the supplied location hints, then delegates to the lazily constructed *ActionEvaluator*.
+
+        When no actions are configured this is a no-op that returns an empty list immediately.
+
+        Note: action evaluation requires that the engine was constructed with an *observer* and
+        that *observed_metrics* was obtained from a triggered Spark *Observation*. If the
+        *batch_observation* was never triggered (e.g. no output table was written and the
+        metrics-only path was skipped), the metrics will be empty and actions will not receive
+        meaningful values — avoid calling *evaluate_actions* in that case.
+
+        Args:
+            observed_metrics: Mapping of metric name to value collected from a Spark *Observation*.
+            input_location: Source path/URI of the data being checked, or *None*.
+            output_location: Destination path/URI of checked output, or *None*.
+            quarantine_location: Path/URI where quarantined rows are written, or *None*.
+            checks_location: Path/URI of the checks definition file, or *None*.
+            rule_set_fingerprint: Fingerprint of the rule set applied, or *None*.
+
+        Returns:
+            List of *ActionResult* instances for every action that actually fired.  Returns an
+            empty list when no actions are configured.
+
+        Raises:
+            PipelineFailedError: When a *FailPipeline* action's condition is met, after all
+                other actions have been evaluated and their notifications delivered.
+        """
+        evaluator = self._get_action_evaluator()
+        if evaluator is None:
+            return []
+
+        run_time = self._engine.run_time_overwrite or datetime.now(timezone.utc)
+        context = ActionContext(
+            metrics=observed_metrics,
+            run_id=self._engine.run_id,
+            run_time=run_time,
+            run_name="dqx",
+            input_location=input_location,
+            output_location=output_location,
+            quarantine_location=quarantine_location,
+            checks_location=checks_location,
+            rule_set_fingerprint=rule_set_fingerprint,
+            user_metadata=self._engine.engine_user_metadata,
+        )
+        return evaluator.evaluate(context)
+
+    def _finalize_batch(
+        self,
+        *,
+        batch_observation: Observation | None,
+        metrics_only_df: DataFrame | None,
+        target_streaming_query: StreamingQuery | None,
+        metrics_config: OutputConfig | None,
+        input_config: InputConfig,
+        output_config: OutputConfig | None,
+        quarantine_config: OutputConfig | None,
+        checks_location: str | None,
+        rule_set_fingerprint: str | None,
+    ) -> None:
+        """Save metrics and evaluate actions for a completed batch run.
+
+        This helper is called by both *apply_checks_and_save_in_table* and
+        *apply_checks_by_metadata_and_save_in_table* after all data writes have been
+        submitted. It handles:
+
+        1. Triggering the Spark *Observation* via a ``count()`` when actions are
+           configured but *metrics_config* is absent and no output/quarantine write
+           has triggered the observation yet (metrics-only-for-actions path).
+        2. Persisting summary metrics to *metrics_config* (batch path only, no
+           streaming query active).
+        3. Evaluating all configured *DQAction* instances (batch path only, when
+           *batch_observation* is populated).
+
+        Note: When *batch_observation* is *None* (no observer configured), actions
+        are not evaluated because observed metrics are unavailable.
+
+        Args:
+            batch_observation: Spark *Observation* carrying collected metrics, or *None*.
+            metrics_only_df: The checked DataFrame used in the metrics-only path
+                (no output/quarantine write), or *None* when an output write was done.
+            target_streaming_query: The active streaming query, or *None* for batch.
+            metrics_config: Destination config for writing summary metrics, or *None*.
+            input_config: Source configuration (provides *input_location* for context).
+            output_config: Output configuration, or *None*.
+            quarantine_config: Quarantine configuration, or *None*.
+            checks_location: Path/URI of the checks file, or *None*.
+            rule_set_fingerprint: Fingerprint of the applied rule set, or *None*.
+        """
+        # Actions-only path: when actions are configured but metrics_config is absent, the Spark
+        # Observation has not yet been triggered (no output/quarantine write was done, and
+        # _populate_batch_observation only fires count() when metrics_config is set).  The two
+        # count() triggers are therefore mutually exclusive — this branch handles the complementary
+        # actions-only path to ensure the observation is populated before evaluate_actions reads it.
+        if self._actions and batch_observation is not None and metrics_config is None and metrics_only_df is not None:
+            metrics_only_df.count()
+
+        if metrics_config and batch_observation is not None and target_streaming_query is None:
+            self.save_summary_metrics(
+                observed_metrics=batch_observation.get,
+                metrics_config=metrics_config,
+                input_config=input_config,
+                output_config=output_config,
+                quarantine_config=quarantine_config,
+                checks_location=checks_location,
+                rule_set_fingerprint=rule_set_fingerprint,
+            )
+
+        if self._actions and batch_observation is not None and target_streaming_query is None:
+            self.evaluate_actions(
+                batch_observation.get,
+                input_location=input_config.location,
+                output_location=output_config.location if output_config else None,
+                quarantine_location=quarantine_config.location if quarantine_config else None,
+                checks_location=checks_location,
+                rule_set_fingerprint=rule_set_fingerprint,
+            )
+
+    @staticmethod
+    def _validate_save_destination_configs(
+        output_config: OutputConfig | None,
+        quarantine_config: OutputConfig | None,
+        metrics_config: OutputConfig | None,
+    ) -> None:
+        if output_config is None and quarantine_config is None and metrics_config is None:
+            raise InvalidParameterError(
+                "At least one of 'output_config', 'quarantine_config' or 'metrics_config' must be provided"
+            )
+
+    def _validate_metrics_observer(self, metrics_config: OutputConfig | None) -> None:
+        """Validate that summary metrics can be collected whenever they are requested.
+
+        Summary metrics come from a Spark Observation that only exists when the engine is constructed with an
+        observer. If *metrics_config* is provided without one, the metrics table would be silently skipped -
+        regardless of whether output/quarantine tables are also written - so fail fast instead.
+
+        Args:
+            metrics_config: Configuration for writing summary metrics, if any.
+
+        Raises:
+            InvalidParameterError: If *metrics_config* is provided but the engine has no observer.
+        """
+        if metrics_config is not None and not self._engine.observer:
+            raise InvalidParameterError("Metrics cannot be collected for engine with no observer")
+
+    def _validate_metrics_only_save(
+        self,
+        input_config: InputConfig,
+        output_config: OutputConfig | None,
+        quarantine_config: OutputConfig | None,
+        metrics_config: OutputConfig | None,
+    ) -> None:
+        if output_config is not None or quarantine_config is not None or metrics_config is None:
+            return
+
+        if input_config.is_streaming:
+            raise InvalidParameterError(
+                "Metrics-only writes are not supported for streaming input. Provide 'output_config' or "
+                "'quarantine_config' to run a streaming query that can emit summary metrics."
+            )
+
     @telemetry_logger("engine", "apply_checks_and_save_in_table")
     def apply_checks_and_save_in_table(
         self,
         input_config: InputConfig,
-        output_config: OutputConfig,
+        output_config: OutputConfig | None = None,
         checks: list[DQRule] | None = None,
         quarantine_config: OutputConfig | None = None,
         metrics_config: OutputConfig | None = None,
@@ -709,18 +1090,21 @@ class DQEngine(DQEngineBase):
         """
         Apply data quality checks to input data and save results.
 
-        If *quarantine_config* is provided, split the data into valid and invalid records:
-        - valid records are written using *output_config*.
+        If *quarantine_config* is provided, the data is split into valid and invalid records:
+        - valid records are written using *output_config* (skipped when *output_config* is not provided).
         - invalid records are written using *quarantine_config*.
 
-        If *quarantine_config* is not provided, write all rows (including result columns) using *output_config*.
+        If *quarantine_config* is not provided and *output_config* is provided, all rows (including result columns)
+        are written using *output_config*.
 
-        If *metrics_config* is provided and the `DQEngine` has a valid `observer`, data quality summary metrics will be
+        If *metrics_config* is provided and the `DQEngine` has a valid `observer`, data quality summary metrics are
         tracked and written using *metrics_config*.
 
         Args:
             input_config: Input configuration (e.g., table/view or file location and read options).
-            output_config: Output configuration (e.g., table name, mode, and write options).
+            output_config: Output configuration (e.g., table name, mode, and write options). Optional when
+                *quarantine_config* is provided, in which case valid records are not written, or when only
+                *metrics_config* is provided for batch summary metrics.
             checks: Optional list of *DQRule* checks to apply. If not provided, checks_location must be provided.
             quarantine_config: Optional configuration for writing invalid records.
             metrics_config: Optional configuration for writing summary metrics.
@@ -729,11 +1113,21 @@ class DQEngine(DQEngineBase):
                 - If 'checks' parameter is provided, it is only used for reporting purposes
                 - If 'checks' parameter is not provided, it is used for loading checks from the storage.
             run_config_name: Name of the run configuration to use when loading checks from a table.
+
+        Raises:
+            InvalidParameterError: If both *checks* and *checks_location* are not specified, if none of
+                *output_config*, *quarantine_config*, and *metrics_config* are specified, if *metrics_config* is
+                provided while the engine has no observer to collect metrics, or if metrics-only is requested for
+                streaming.
         """
         logger.info(f"Applying checks to {input_config.location}")
 
         if checks is None and checks_location is None:
             raise InvalidParameterError("Either 'checks_location' or 'checks' must be provided")
+
+        self._validate_save_destination_configs(output_config, quarantine_config, metrics_config)
+        self._validate_metrics_observer(metrics_config)
+        self._validate_metrics_only_save(input_config, output_config, quarantine_config, metrics_config)
 
         if checks is None and checks_location:
             storage_handler, storage_config = self._checks_handler_factory.create_for_location(
@@ -748,6 +1142,7 @@ class DQEngine(DQEngineBase):
         batch_observation = None
         output_streaming_query = None
         quarantine_streaming_query = None
+        metrics_only_df: DataFrame | None = None
 
         if quarantine_config:
             check_result = self.apply_checks_and_split(df, checks, ref_dfs)
@@ -755,7 +1150,8 @@ class DQEngine(DQEngineBase):
                 good_df, bad_df, batch_observation = check_result
             else:
                 good_df, bad_df = check_result
-            output_streaming_query = save_dataframe_as_table(good_df, output_config)
+            if output_config is not None:
+                output_streaming_query = save_dataframe_as_table(good_df, output_config)
             quarantine_streaming_query = save_dataframe_as_table(bad_df, quarantine_config)
             target_streaming_query = quarantine_streaming_query
         else:
@@ -764,14 +1160,19 @@ class DQEngine(DQEngineBase):
                 checked_df, batch_observation = check_result
             else:
                 checked_df = check_result
-            output_streaming_query = save_dataframe_as_table(checked_df, output_config)
+            if output_config is not None:
+                output_streaming_query = save_dataframe_as_table(checked_df, output_config)
+            else:
+                metrics_only_df = checked_df
             target_streaming_query = output_streaming_query
 
         assert checks is not None  # guaranteed: either provided or loaded from checks_location above
         rule_set_fingerprint = compute_rule_set_fingerprint(checks) if checks else None
 
+        _populate_batch_observation(metrics_config, batch_observation, metrics_only_df)
+
         # Add listener for streaming metrics, targeting the specific query to avoid duplicates
-        if self._engine.observer and metrics_config and target_streaming_query is not None:
+        if self._engine.observer and (metrics_config or self._actions) and target_streaming_query is not None:
             listener = self.get_streaming_metrics_listener(
                 input_config=input_config,
                 output_config=output_config,
@@ -787,22 +1188,23 @@ class DQEngine(DQEngineBase):
             output_config, output_streaming_query, quarantine_config, quarantine_streaming_query
         )
 
-        if metrics_config and batch_observation is not None and target_streaming_query is None:
-            self.save_summary_metrics(
-                observed_metrics=batch_observation.get,
-                metrics_config=metrics_config,
-                input_config=input_config,
-                output_config=output_config,
-                quarantine_config=quarantine_config,
-                checks_location=checks_location,
-                rule_set_fingerprint=rule_set_fingerprint,
-            )
+        self._finalize_batch(
+            batch_observation=batch_observation,
+            metrics_only_df=metrics_only_df,
+            target_streaming_query=target_streaming_query,
+            metrics_config=metrics_config,
+            input_config=input_config,
+            output_config=output_config,
+            quarantine_config=quarantine_config,
+            checks_location=checks_location,
+            rule_set_fingerprint=rule_set_fingerprint,
+        )
 
     @telemetry_logger("engine", "apply_checks_by_metadata_and_save_in_table")
     def apply_checks_by_metadata_and_save_in_table(
         self,
         input_config: InputConfig,
-        output_config: OutputConfig,
+        output_config: OutputConfig | None = None,
         checks: list[dict] | None = None,
         quarantine_config: OutputConfig | None = None,
         metrics_config: OutputConfig | None = None,
@@ -814,15 +1216,21 @@ class DQEngine(DQEngineBase):
         """
         Apply metadata-defined data quality checks to input data and save results.
 
-        If *quarantine_config* is provided, split the data into valid and invalid records:
-        - valid records are written using *output_config*;
+        If *quarantine_config* is provided, the data is split into valid and invalid records:
+        - valid records are written using *output_config* (skipped when *output_config* is not provided).
         - invalid records are written using *quarantine_config*.
 
-        If *quarantine_config* is not provided, write all rows (including result columns) using *output_config*.
+        If *quarantine_config* is not provided and *output_config* is provided, all rows (including result columns)
+        are written using *output_config*.
+
+        If *metrics_config* is provided and the `DQEngine` has a valid `observer`, data quality summary metrics are
+        tracked and written using *metrics_config*.
 
         Args:
             input_config: Input configuration (e.g., table/view or file location and read options).
-            output_config: Output configuration (e.g., table name, mode, and write options).
+            output_config: Output configuration (e.g., table name, mode, and write options). Optional when
+                *quarantine_config* is provided, in which case valid records are not written, or when only
+                *metrics_config* is provided for batch summary metrics.
             checks: Optional list of dicts containing checks to apply. If not provided, checks_location must be provided.
                 Each check dictionary must contain the following:
                 - *check* - A check definition including check function and arguments to use.
@@ -838,11 +1246,21 @@ class DQEngine(DQEngineBase):
                 - If 'checks' param is provided, the parameter is only used for reporting purposes.
                 - If 'checks' param is not provided, the parameter is used for loading checks from the storage.
             run_config_name: Name of the run configuration to use when loading checks from a table.
+
+        Raises:
+            InvalidParameterError: If both *checks* and *checks_location* are not specified, if none of
+                *output_config*, *quarantine_config*, and *metrics_config* are specified, if *metrics_config* is
+                provided while the engine has no observer to collect metrics, or if metrics-only is requested for
+                streaming.
         """
         logger.info(f"Applying checks to {input_config.location}")
 
         if checks is None and checks_location is None:
             raise InvalidParameterError("Either 'checks_location' or 'checks' must be provided")
+
+        self._validate_save_destination_configs(output_config, quarantine_config, metrics_config)
+        self._validate_metrics_observer(metrics_config)
+        self._validate_metrics_only_save(input_config, output_config, quarantine_config, metrics_config)
 
         if checks is None and checks_location:
             storage_handler, storage_config = self._checks_handler_factory.create_for_location(
@@ -856,6 +1274,7 @@ class DQEngine(DQEngineBase):
         batch_observation = None
         output_streaming_query = None
         quarantine_streaming_query = None
+        metrics_only_df: DataFrame | None = None
 
         if quarantine_config:
             check_result = self.apply_checks_by_metadata_and_split(
@@ -865,7 +1284,8 @@ class DQEngine(DQEngineBase):
                 good_df, bad_df, batch_observation = check_result
             else:
                 good_df, bad_df = check_result
-            output_streaming_query = save_dataframe_as_table(good_df, output_config)
+            if output_config is not None:
+                output_streaming_query = save_dataframe_as_table(good_df, output_config)
             quarantine_streaming_query = save_dataframe_as_table(bad_df, quarantine_config)
             target_streaming_query = quarantine_streaming_query
         else:
@@ -876,7 +1296,10 @@ class DQEngine(DQEngineBase):
                 checked_df, batch_observation = check_result
             else:
                 checked_df = check_result
-            output_streaming_query = save_dataframe_as_table(checked_df, output_config)
+            if output_config is not None:
+                output_streaming_query = save_dataframe_as_table(checked_df, output_config)
+            else:
+                metrics_only_df = checked_df
             target_streaming_query = output_streaming_query
 
         assert checks is not None  # guaranteed: either provided or loaded from checks_location above
@@ -884,8 +1307,10 @@ class DQEngine(DQEngineBase):
             compute_rule_set_fingerprint_by_metadata(checks, custom_check_functions) if checks else None
         )
 
+        _populate_batch_observation(metrics_config, batch_observation, metrics_only_df)
+
         # Add listener for streaming metrics, targeting the specific query to avoid duplicates
-        if self._engine.observer and metrics_config and target_streaming_query is not None:
+        if self._engine.observer and (metrics_config or self._actions) and target_streaming_query is not None:
             listener = self.get_streaming_metrics_listener(
                 input_config=input_config,
                 output_config=output_config,
@@ -901,16 +1326,17 @@ class DQEngine(DQEngineBase):
             output_config, output_streaming_query, quarantine_config, quarantine_streaming_query
         )
 
-        if metrics_config and batch_observation is not None and target_streaming_query is None:
-            self.save_summary_metrics(
-                observed_metrics=batch_observation.get,
-                metrics_config=metrics_config,
-                input_config=input_config,
-                output_config=output_config,
-                quarantine_config=quarantine_config,
-                checks_location=checks_location,
-                rule_set_fingerprint=rule_set_fingerprint,
-            )
+        self._finalize_batch(
+            batch_observation=batch_observation,
+            metrics_only_df=metrics_only_df,
+            target_streaming_query=target_streaming_query,
+            metrics_config=metrics_config,
+            input_config=input_config,
+            output_config=output_config,
+            quarantine_config=quarantine_config,
+            checks_location=checks_location,
+            rule_set_fingerprint=rule_set_fingerprint,
+        )
 
     @telemetry_logger("engine", "apply_checks_and_save_in_tables")
     def apply_checks_and_save_in_tables(
@@ -919,16 +1345,17 @@ class DQEngine(DQEngineBase):
         max_parallelism: int | None = os.cpu_count(),
     ) -> None:
         """
-        Apply data quality checks to multiple tables or views and write the results to output table(s).
+        Apply data quality checks to multiple tables or views and write the results to output and/or metrics table(s).
 
         If quarantine tables are provided in the run configuration, the data will be split into
         good and bad records, with good records written to the output table and bad records to the
-        quarantine table. If quarantine tables are not provided, all records (with error/warning
-        columns) will be written to the output table.
+        quarantine table. If quarantine tables are not provided and output tables are provided, all records
+        (with error/warning columns) will be written to the output table. If only metrics tables are provided,
+        only summary metrics will be written.
 
         Args:
             run_configs (list[RunConfig]): List of run configurations containing input configs, output configs,
-                quarantine configs, and a checks file location.
+                quarantine configs, metrics configs, and a checks file location.
             max_parallelism (int, optional): Maximum number of tables to check in parallel. Defaults to the
                 number of CPU cores.
 
@@ -959,11 +1386,14 @@ class DQEngine(DQEngineBase):
         """
         Apply data quality checks to tables or views matching a pattern and write the results to output table(s).
 
-        If quarantine option is enabled the data will be split into
-        good and bad records, with good records written to the output table
-        (under the same name as input table and "_dq" suffix) and bad records to the
-        quarantine table (under the same name as input table and "_quarantine" suffix).
-        If quarantine is not enabled, all records (with error/warning columns) will be written to the output table.
+        If quarantine option is enabled the data is split into good and bad records, with good
+        records written to the output table (under the same name as input table and "_dq" suffix)
+        and bad records to the quarantine table (under the same name as input table and
+        "_quarantine" suffix). When *output_config* is omitted on the template and
+        *quarantine_config* is provided, valid records are not written and only the quarantine
+        table is produced per matched table. When only *metrics_config* is provided on the template,
+        only summary metrics are written. If quarantine is not enabled and metrics-only is not configured,
+        all records (with error/warning columns) will be written to the output table.
 
         Checks are expected to be available under the same name as the table, with a .yml extension.
 
@@ -987,7 +1417,15 @@ class DQEngine(DQEngineBase):
         Returns:
             None
         """
-        if not output_table_suffix:
+        metrics_only = (
+            run_config_template.metrics_config is not None
+            and run_config_template.output_config is None
+            and run_config_template.quarantine_config is None
+        )
+        write_output = not metrics_only and (
+            run_config_template.output_config is not None or run_config_template.quarantine_config is None
+        )
+        if write_output and not output_table_suffix:
             raise InvalidParameterError("Output table suffix cannot be empty.")
 
         if run_config_template.quarantine_config and not quarantine_table_suffix:
@@ -996,7 +1434,7 @@ class DQEngine(DQEngineBase):
         if run_config_template.input_config is None:
             run_config_template.input_config = InputConfig(location="")  # location derived from patterns
 
-        if run_config_template.output_config is None:
+        if write_output and run_config_template.output_config is None:
             run_config_template.output_config = OutputConfig(location="")  # location derived from patterns
 
         tables = list_tables(
@@ -1011,11 +1449,12 @@ class DQEngine(DQEngineBase):
             run_config = copy.deepcopy(run_config_template)
 
             assert run_config.input_config  # to satisfy linter
-            assert run_config.output_config  # to satisfy linter
 
             run_config.name = table
             run_config.input_config.location = table
-            run_config.output_config.location = f"{table}{output_table_suffix}"
+
+            if run_config.output_config:
+                run_config.output_config.location = f"{table}{output_table_suffix}"
 
             if run_config.quarantine_config:
                 run_config.quarantine_config.location = f"{table}{quarantine_table_suffix}"
@@ -1035,25 +1474,35 @@ class DQEngine(DQEngineBase):
         checks: list[dict],
         custom_check_functions: dict[str, Callable] | None = None,
         validate_custom_check_functions: bool = True,
+        semantic_validation_mode: str | None = ChecksSemanticValidationMode.WARN,
     ) -> ChecksValidationStatus:
         """
         Validate checks defined as metadata to ensure they conform to the expected structure and types.
 
         This method validates the presence of required keys, the existence and callability of functions,
-        and the types of arguments passed to those functions.
+        and the types of arguments passed to those functions. It also runs semantic validation across the
+        ruleset to detect duplicate and conflicting rules.
 
         Args:
             checks: List of checks to apply to the DataFrame. Each check should be a dictionary.
             custom_check_functions: Optional dictionary with custom check functions (e.g., *globals()* of the calling module).
             validate_custom_check_functions: If True, validate custom check functions.
+            semantic_validation_mode: Controls how semantic issues are surfaced.
+                Use *ChecksSemanticValidationMode.WARN* (default) to log warnings,
+                *ChecksSemanticValidationMode.FAIL* to raise on any issue, or
+                *None* to skip semantic validation entirely.
 
         Returns:
             ChecksValidationStatus indicating the validation result.
+
+        Raises:
+            ValueError: If semantic_validation_mode is FAIL and issues are found.
         """
         return DQEngineCore.validate_checks(
             checks=checks,
             custom_check_functions=custom_check_functions,
             validate_custom_check_functions=validate_custom_check_functions,
+            semantic_validation_mode=semantic_validation_mode,
         )
 
     def get_invalid(self, df: DataFrame) -> DataFrame:
@@ -1103,6 +1552,7 @@ class DQEngine(DQEngineBase):
         - If *quarantine_df* is provided and *quarantine_config* is None, load the run config and use its *quarantine_config*.
         - If *observation* is provided and *metrics_config* is None, load the run config and use its *metrics_config*
         - A write occurs only when both a DataFrame and its corresponding config are available.
+        - If only *observation* and *metrics_config* are provided, only summary metrics are written.
 
         Args:
             output_df: DataFrame with valid rows to be saved (optional).
@@ -1120,8 +1570,11 @@ class DQEngine(DQEngineBase):
         Returns:
             None
         """
-        if not output_df and not quarantine_df:
-            raise InvalidConfigError("At least one of 'output_df' or 'quarantine_df' Dataframe must be present.")
+        if output_df is None and quarantine_df is None and observation is None:
+            raise InvalidConfigError(
+                "At least one of 'output_df' or 'quarantine_df' Dataframe must be present. "
+                "For metrics-only writes, provide 'observation'."
+            )
 
         if output_df is not None and output_config is None:
             run_config = self._config_serializer.load_run_config(
@@ -1150,6 +1603,11 @@ class DQEngine(DQEngineBase):
             )
             metrics_config = run_config.metrics_config
 
+        if output_df is None and quarantine_df is None and metrics_config is None:
+            raise InvalidConfigError(
+                "At least one of 'output_config', 'quarantine_config' or 'metrics_config' must be provided"
+            )
+
         output_query = None
         quarantine_query = None
 
@@ -1163,7 +1621,7 @@ class DQEngine(DQEngineBase):
         target_query = quarantine_query if quarantine_query else output_query
 
         # Add listener for streaming metrics, targeting the specific query to avoid duplicates
-        if self._engine.observer and metrics_config is not None and target_query is not None:
+        if self._engine.observer and (metrics_config is not None or self._actions) and target_query is not None:
             listener = self.get_streaming_metrics_listener(
                 output_config=output_config,
                 quarantine_config=quarantine_config,
@@ -1188,7 +1646,10 @@ class DQEngine(DQEngineBase):
 
     @telemetry_logger("engine", "load_checks")
     def load_checks(
-        self, config: BaseChecksStorageConfig, variables: dict[str, VariableValue] | None = None
+        self,
+        config: BaseChecksStorageConfig,
+        variables: dict[str, VariableValue] | None = None,
+        semantic_validation_mode: str | None = ChecksSemanticValidationMode.WARN,
     ) -> list[dict]:
         """Load DQ rules (checks) from the storage backend described by *config*.
 
@@ -1214,17 +1675,25 @@ class DQEngine(DQEngineBase):
             config: Configuration object describing the storage backend.
             variables: Optional mapping of placeholder names to replacement values. Replaces placeholders
                 in all string values of the check definitions before returning.
+            semantic_validation_mode: Controls semantic validation behavior after loading.
+                Use *ChecksSemanticValidationMode.WARN* (default) to log warnings and continue,
+                *ChecksSemanticValidationMode.FAIL* to raise if issues are found, or
+                *None* to skip semantic validation entirely.
 
         Returns:
             List of DQ rules (checks) represented as dictionaries.
 
         Raises:
             InvalidConfigError: If the configuration type is unsupported.
+            ValueError: If semantic_validation_mode is FAIL and issues are found.
         """
         handler = self._checks_handler_factory.create(config)
         checks = handler.load(config)
         merged_variables = self._merge_variables(variables)
-        return resolve_variables(checks=checks, variables=merged_variables)
+        resolved = resolve_variables(checks=checks, variables=merged_variables)
+        if semantic_validation_mode is not None:
+            ChecksSemanticValidator.apply(resolved, mode=semantic_validation_mode)
+        return resolved
 
     def _merge_variables(self, per_call: dict[str, VariableValue] | None) -> dict[str, VariableValue] | None:
         """Merge engine-level default variables with per-call overrides.
@@ -1246,6 +1715,7 @@ class DQEngine(DQEngineBase):
         checks: list[dict],
         config: BaseChecksStorageConfig,
         variables: dict[str, VariableValue] | None = None,
+        semantic_validation_mode: str | None = ChecksSemanticValidationMode.WARN,
     ) -> None:
         """Persist DQ rules (checks) to the storage backend described by *config*.
 
@@ -1272,17 +1742,173 @@ class DQEngine(DQEngineBase):
             config: Configuration object describing the storage backend and write options.
             variables: Optional mapping of placeholder names to replacement values. Replaces placeholders
                 in all string values of the check definitions before saving.
+            semantic_validation_mode: Controls semantic validation behavior before saving.
+                Use *ChecksSemanticValidationMode.WARN* (default) to log warnings and continue,
+                *ChecksSemanticValidationMode.FAIL* to abort saving if issues are found, or
+                *None* to skip semantic validation entirely.
 
         Returns:
             None
 
         Raises:
             InvalidConfigError: If the configuration type is unsupported.
+            ValueError: If semantic_validation_mode is FAIL and issues are found.
         """
         merged_variables = self._merge_variables(variables)
         resolved_checks = resolve_variables(checks=checks, variables=merged_variables)
+        if semantic_validation_mode is not None:
+            ChecksSemanticValidator.apply(resolved_checks, mode=semantic_validation_mode)
         handler = self._checks_handler_factory.create(config)
         handler.save(resolved_checks, config)
+
+    def _build_metrics_observation(
+        self,
+        observed_metrics: dict[str, Any] | None = None,
+        input_config: InputConfig | None = None,
+        output_config: OutputConfig | None = None,
+        quarantine_config: OutputConfig | None = None,
+        checks_location: str | None = None,
+        rule_set_fingerprint: str | None = None,
+    ) -> DQMetricsObservation:
+        """Build a *DQMetricsObservation* from the engine's run state and the given configs/metadata.
+
+        Args:
+            observed_metrics: Collected summary metrics, when already available (the observe / streaming path).
+            input_config: Optional input configuration recorded for traceability.
+            output_config: Optional output configuration recorded for traceability.
+            quarantine_config: Optional quarantine configuration recorded for traceability.
+            checks_location: Optional checks location recorded for traceability.
+            rule_set_fingerprint: Optional SHA-256 fingerprint of the rule set used for this run.
+
+        Returns:
+            A *DQMetricsObservation* populated from the engine's run id, run time, result column names, and metadata.
+        """
+        # run_name comes from the engine's observer. It is None only on the metrics-only
+        # save_results_in_table path, where the caller persists a previously produced Observation
+        # through an engine that has no observer of its own — the raw Spark Observation carries only
+        # metric values, not the originating observer's name, so the name is unrecoverable here.
+        if self._engine.observer is not None:
+            run_name = self._engine.observer.name
+        else:
+            run_name = None
+            logger.info(
+                "No observer configured on this engine; run_name will be null in the saved summary metrics. "
+                "Pass the engine that produced the metrics (the one with the DQMetricsObserver) to record its name."
+            )
+
+        return DQMetricsObservation(
+            run_id=self._engine.run_id,
+            run_name=run_name,
+            run_time_overwrite=self._engine.run_time_overwrite,
+            observed_metrics=observed_metrics,
+            error_column_name=self._engine.result_column_names[ColumnArguments.ERRORS],
+            warning_column_name=self._engine.result_column_names[ColumnArguments.WARNINGS],
+            input_location=input_config.location if input_config else None,
+            output_location=output_config.location if output_config else None,
+            quarantine_location=quarantine_config.location if quarantine_config else None,
+            checks_location=checks_location,
+            rule_set_fingerprint=rule_set_fingerprint,
+            user_metadata=self._engine.engine_user_metadata,
+        )
+
+    @telemetry_logger("engine", "compute_summary_metrics")
+    def compute_summary_metrics(
+        self,
+        checked_df: DataFrame,
+        checks: list[dict] | None = None,
+        custom_check_functions: dict[str, Callable] | None = None,
+        input_config: InputConfig | None = None,
+        output_config: OutputConfig | None = None,
+        quarantine_config: OutputConfig | None = None,
+        checks_location: str | None = None,
+        run_config_name: str = "default",
+    ) -> DataFrame:
+        """Compute data quality summary metrics from a checked DataFrame by aggregation.
+
+        Unlike the observer/listener path (which relies on Spark *observe()* and a caller-triggered
+        action), this computes the same metrics as a plain aggregation over the result columns and
+        returns a lazy DataFrame. This makes it usable inside Spark Declarative Pipelines (SDP /
+        Lakeflow / DLT), where the pipeline runtime — not the caller — owns the write action: define a
+        downstream materialized view over the checked table that returns the result of this method.
+
+        Args:
+            checked_df: DataFrame produced by *apply_checks* / *apply_checks_by_metadata* (must still
+                contain the DQX result columns, i.e. before *get_valid* / *get_invalid* drop them).
+            checks: Optional metadata checks that were applied (the same list of dicts passed to
+                *apply_checks_by_metadata*). When provided, a per-check breakdown (*check_metrics*) is
+                included covering every applied check, including checks with zero violations. The breakdown
+                is derived from the check names and cannot be reconstructed from data alone, so pass the
+                same checks used when applying. When omitted (and no *checks_location* is given), only
+                dataset-level metrics (row counts and any observer custom metrics) are produced.
+            custom_check_functions: Optional custom check functions used to resolve metadata checks. Pass the
+                *same* functions that were used when the checks were applied — if the applied checks referenced a
+                custom function and it is not supplied here, deserialization fails or resolves a different check
+                name, so the *check_metrics* breakdown and *rule_set_fingerprint* would not match the applied run.
+            input_config: Optional input configuration recorded in the metrics for traceability.
+            output_config: Optional output configuration recorded in the metrics for traceability.
+            quarantine_config: Optional quarantine configuration recorded in the metrics for traceability.
+            checks_location: Optional checks location. Recorded in the metrics for traceability, and — when
+                *checks* is not passed — the checks are loaded from here so the per-check breakdown and
+                *rule_set_fingerprint* are still produced.
+            run_config_name: Name of the run configuration to use when loading checks from a table
+                (only used when *checks* is None and *checks_location* points to a table).
+
+        Note:
+            A *DQMetricsObserver* must be configured on this engine (*DQEngine(..., observer=...)*); its
+            *custom_metrics* (if any) are included alongside the built-in dataset-level metrics and the
+            per-check breakdown (when *checks* is provided or loaded from *checks_location*).
+
+        Returns:
+            A lazy DataFrame matching *OBSERVATION_TABLE_SCHEMA* with one row per metric.
+
+        Raises:
+            InvalidParameterError: If no *DQMetricsObserver* is configured on the engine, or if *checked_df*
+                does not contain the DQX result columns.
+        """
+        observer = self._engine.observer
+        if observer is None:
+            raise InvalidParameterError(
+                "Summary metrics cannot be computed for an engine with no observer. "
+                "Configure a DQMetricsObserver on the engine, e.g. DQEngine(workspace_client, observer=DQMetricsObserver(...))."
+            )
+
+        # selectExpr below references the DQX result columns (_errors / _warnings). Fail early with a
+        # clear message if they are absent — e.g. the caller passed a DataFrame after get_valid /
+        # get_invalid dropped them — rather than letting Spark raise a cryptic column-not-found error.
+        error_column = self._engine.result_column_names[ColumnArguments.ERRORS]
+        warning_column = self._engine.result_column_names[ColumnArguments.WARNINGS]
+        missing_columns = [c for c in (error_column, warning_column) if c not in checked_df.columns]
+        if missing_columns:
+            raise InvalidParameterError(
+                f"checked_df is missing the DQX result column(s) {missing_columns}. Pass the DataFrame returned "
+                "by apply_checks / apply_checks_by_metadata (before get_valid / get_invalid drop the result columns)."
+            )
+
+        # Load checks from the location when they were not passed inline, so the per-check breakdown and
+        # rule_set_fingerprint are still produced (mirrors apply_checks_by_metadata).
+        if checks is None and checks_location:
+            storage_handler, storage_config = self._checks_handler_factory.create_for_location(
+                location=checks_location, run_config_name=run_config_name
+            )
+            checks = storage_handler.load(storage_config)
+
+        check_names: list[str] | None = None
+        rule_set_fingerprint: str | None = None
+        if checks:
+            rules = deserialize_checks(checks, custom_check_functions)
+            # Duplicate check names are preserved so check_metrics reports each occurrence separately.
+            check_names = [rule.name for rule in rules]
+            rule_set_fingerprint = compute_rule_set_fingerprint(rules)
+
+        aggregated_df = checked_df.selectExpr(*observer.get_metrics(check_names))
+        observation = self._build_metrics_observation(
+            input_config=input_config,
+            output_config=output_config,
+            quarantine_config=quarantine_config,
+            checks_location=checks_location,
+            rule_set_fingerprint=rule_set_fingerprint,
+        )
+        return DQMetricsObserver.build_metrics_df_from_aggregation(aggregated_df, observation)
 
     @telemetry_logger("engine", "save_summary_metrics")
     def save_summary_metrics(
@@ -1299,7 +1925,7 @@ class DQEngine(DQEngineBase):
         Save data quality summary metrics to a table.
 
         This method extracts observed metrics from a Spark Observation and persists them to a configured
-        output destination. Metrics are only saved if an observer is configured on the engine.
+        output destination.
 
         Args:
             observed_metrics: Collected summary metrics from Spark Observation.
@@ -1317,29 +1943,22 @@ class DQEngine(DQEngineBase):
             This method is only supported by spark batch. Spark query listener must be used for streaming:
             For streaming use spark.streams.addListener(get_streaming_metrics_listener(..))
         """
-        if self._engine.observer:
-            metrics_observation = DQMetricsObservation(
-                run_id=self._engine.run_id,
-                run_name=self._engine.observer.name,
-                run_time_overwrite=self._engine.run_time_overwrite,
-                observed_metrics=observed_metrics,
-                error_column_name=self._engine.result_column_names[ColumnArguments.ERRORS],
-                warning_column_name=self._engine.result_column_names[ColumnArguments.WARNINGS],
-                input_location=input_config.location if input_config else None,
-                output_location=output_config.location if output_config else None,
-                quarantine_location=quarantine_config.location if quarantine_config else None,
-                checks_location=checks_location,
-                rule_set_fingerprint=rule_set_fingerprint,
-                user_metadata=self._engine.engine_user_metadata,
-            )
+        metrics_observation = self._build_metrics_observation(
+            observed_metrics=observed_metrics,
+            input_config=input_config,
+            output_config=output_config,
+            quarantine_config=quarantine_config,
+            checks_location=checks_location,
+            rule_set_fingerprint=rule_set_fingerprint,
+        )
 
-            metrics_df = self._engine.observer.build_metrics_df(self.spark, metrics_observation)
-            save_dataframe_as_table(metrics_df, metrics_config)
+        metrics_df = DQMetricsObserver.build_metrics_df(self.spark, metrics_observation)
+        save_dataframe_as_table(metrics_df, metrics_config)
 
     @telemetry_logger("engine", "get_streaming_metrics_listener")
     def get_streaming_metrics_listener(
         self,
-        metrics_config: OutputConfig,
+        metrics_config: OutputConfig | None = None,
         input_config: InputConfig | None = None,
         output_config: OutputConfig | None = None,
         quarantine_config: OutputConfig | None = None,
@@ -1351,7 +1970,9 @@ class DQEngine(DQEngineBase):
         Gets a `StreamingMetricsListener` object for writing metrics to an output table.
 
         Args:
-            metrics_config: Configuration for writing summary metrics, including table name, mode, and options.
+            metrics_config: Optional configuration for writing summary metrics (table name, mode, options).
+                When *None*, no metrics table is written; the listener still evaluates configured actions
+                per micro-batch.
             input_config: Optional configuration for input data containing location.
             output_config: Optional configuration for output data containing location.
             quarantine_config: Optional configuration for quarantine data containing location.
@@ -1371,23 +1992,71 @@ class DQEngine(DQEngineBase):
                 f"Metrics cannot be collected for engine with type '{self._engine.__class__.__name__}'"
             )
 
-        if not self._engine.observer:
-            raise InvalidParameterError("Metrics cannot be collected for engine with no observer")
+        # The listener reads observed metrics from the query progress events, so an observer is
+        # required whether it writes a metrics table or only evaluates actions.
+        self._validate_metrics_observer(metrics_config)
+        if self._engine.observer is None:
+            raise InvalidParameterError("A metrics observer is required to create a streaming metrics listener")
 
-        metrics_observation = DQMetricsObservation(
-            run_id=self._engine.run_id,
-            run_name=self._engine.observer.name,
-            run_time_overwrite=self._engine.run_time_overwrite,
-            error_column_name=self._engine.result_column_names[ColumnArguments.ERRORS],
-            warning_column_name=self._engine.result_column_names[ColumnArguments.WARNINGS],
-            input_location=input_config.location if input_config else None,
-            output_location=output_config.location if output_config else None,
-            quarantine_location=quarantine_config.location if quarantine_config else None,
+        metrics_observation = self._build_metrics_observation(
+            input_config=input_config,
+            output_config=output_config,
+            quarantine_config=quarantine_config,
             checks_location=checks_location,
             rule_set_fingerprint=rule_set_fingerprint,
-            user_metadata=self._engine.engine_user_metadata,
         )
-        return StreamingMetricsListener(metrics_config, metrics_observation, self.spark, target_query_id)
+        evaluator = self._get_action_evaluator()
+        action_callback = self._build_streaming_action_callback(evaluator) if evaluator is not None else None
+        return StreamingMetricsListener(
+            metrics_config, metrics_observation, self.spark, target_query_id, action_callback
+        )
+
+    def _build_streaming_action_callback(
+        self, evaluator: ActionEvaluator
+    ) -> Callable[[DQMetricsObservation, datetime], None]:
+        """Build the action callback passed to the streaming listener.
+
+        Defined here, not on the listener, so *metrics_listener* never imports the actions
+        subsystem: databricks-connect reconstructs the listener by unpickling it in a separate
+        worker process, re-importing the listener's module and its top-level imports — and the
+        actions chain (which imports *pyspark.sql*) fails to re-import there mid-init, raising an
+        *ImportError* for *SparkSession*. The observer-only path passes no callback, so nothing from
+        actions reaches the worker.
+
+        The closure re-raises a *TerminalActionError* (e.g. *FailPipeline*) so the stream can stop,
+        and logs-and-swallows any other error so a failed alert cannot kill the query.
+
+        Args:
+            evaluator: The *ActionEvaluator* to invoke with each micro-batch's *ActionContext*.
+
+        Returns:
+            A callback accepting the per-batch *DQMetricsObservation* and the resolved run time.
+        """
+
+        def callback(observation: DQMetricsObservation, run_time: datetime) -> None:
+            context = ActionContext(
+                metrics=observation.observed_metrics or {},
+                run_id=observation.run_id,
+                run_time=run_time,
+                input_location=observation.input_location,
+                output_location=observation.output_location,
+                quarantine_location=observation.quarantine_location,
+                checks_location=observation.checks_location,
+                rule_set_fingerprint=observation.rule_set_fingerprint,
+                user_metadata=observation.user_metadata,
+            )
+            try:
+                evaluator.evaluate(context)
+            except TerminalActionError:
+                raise
+            except Exception as exc:
+                # Sanitize both the run id and the exception text: an evaluator error may embed
+                # user-supplied values (column/rule names) containing control characters (CWE-117).
+                safe_run_id = sanitize_for_log(observation.run_id)
+                safe_exc = sanitize_for_log(str(exc))
+                logger.warning(f"Action evaluation failed for streaming micro-batch (run_id={safe_run_id}): {safe_exc}")
+
+        return callback
 
     @telemetry_logger("engine", "apply_checks_for_run_config")
     def _apply_checks_for_run_config(self, run_config: RunConfig) -> None:
@@ -1395,7 +2064,7 @@ class DQEngine(DQEngineBase):
         Applies checks based on a given RunConfig.
 
         This method loads checks from the specified location, reads input data using the input config,
-        and writes results using the output and optionally quarantine configs.
+        and writes results using the output and/or quarantine configs.
 
         The storage handler is determined by the factory based on the RunConfig. If Lakebase
         connection parameters are present (lakebase_instance_name), checks will be loaded from
@@ -1403,12 +2072,19 @@ class DQEngine(DQEngineBase):
 
         Args:
             run_config (RunConfig): Specifies the inputs, outputs, and checks file.
+
+        Raises:
+            InvalidConfigError: If *input_config* is not provided, or if *output_config*, *quarantine_config*,
+                and *metrics_config* are all missing from the run configuration.
         """
         if not run_config.input_config:
             raise InvalidConfigError("Input configuration not provided")
 
-        if not run_config.output_config:
-            raise InvalidConfigError("Output configuration not provided")
+        if not run_config.output_config and not run_config.quarantine_config and not run_config.metrics_config:
+            raise InvalidConfigError(
+                "At least one of 'output_config', 'quarantine_config' or 'metrics_config' must be provided "
+                "in the run configuration"
+            )
 
         logger.info(f"Applying checks from {run_config.checks_location} to {run_config.input_config.location}")
 
@@ -1420,7 +2096,11 @@ class DQEngine(DQEngineBase):
         custom_check_functions = resolve_custom_check_functions_from_path(run_config.custom_check_functions)
         ref_dfs = get_reference_dataframes(self.spark, run_config.reference_tables)
 
-        self.apply_checks_by_metadata_and_save_in_table(
+        # Actions are configured per run config via *actions_location*, so a run config with actions is
+        # applied through a dedicated engine carrying that run config's actions, observer, and (optional)
+        # event store. This keeps the shared engine thread-safe under the parallel multi-run-config runner.
+        engine = self._engine_for_run_config(run_config)
+        engine.apply_checks_by_metadata_and_save_in_table(
             checks=checks,
             input_config=run_config.input_config,
             output_config=run_config.output_config,
@@ -1430,6 +2110,140 @@ class DQEngine(DQEngineBase):
             ref_dfs=ref_dfs,
             checks_location=storage_config.location,
         )
+
+    def _engine_for_run_config(self, run_config: RunConfig) -> "DQEngine":
+        """Return the engine used to apply checks for *run_config*.
+
+        When *run_config.actions_location* is set, this loads that run config's action definitions and
+        returns a dedicated *DQEngine* carrying those actions, a fresh observer, and an optional action
+        event store (from *action_events_location*). Otherwise it returns *self* unchanged.
+
+        A dedicated engine is used (rather than mutating *self._actions*) because the multi-run-config
+        runner applies run configs on a thread pool sharing a single engine; per-run-config action state
+        must not leak across threads.
+
+        Args:
+            run_config: The run configuration being applied.
+
+        Returns:
+            *self* when the run config has no actions, otherwise a new *DQEngine* scoped to it.
+        """
+        if not run_config.actions_location:
+            return self
+        actions = self._load_actions_for_run_config(run_config)
+        return self._build_scoped_engine(run_config, actions)
+
+    def _build_scoped_engine(self, run_config: RunConfig, actions: list[DQAction]) -> "DQEngine":
+        """Build a per-run-config *DQEngine* carrying *actions*, a fresh observer, and an event store.
+
+        Returns *self* when *actions* is empty (nothing to fire), so no redundant engine is created.
+
+        Args:
+            run_config: The run configuration being applied.
+            actions: The action definitions loaded for this run config.
+
+        Returns:
+            A new *DQEngine* scoped to *run_config*, or *self* when *actions* is empty.
+        """
+        if not actions:
+            return self
+        base_observer = self._engine.observer
+        observer = DQMetricsObserver(custom_metrics=base_observer.custom_metrics if base_observer else None)
+        return DQEngine(
+            workspace_client=self.ws,
+            spark=self.spark,
+            extra_params=self._extra_params,
+            observer=observer,
+            # DQEngine only reads the actions list; the widening from list[DQAction] is safe.
+            actions=cast("list[DQAction | dict[str, object]]", actions),
+            action_events_config=self._run_config_action_events_config(run_config),
+        )
+
+    def _load_actions_for_run_config(self, run_config: RunConfig) -> list[DQAction]:
+        """Load action definitions declared by *run_config.actions_location*.
+
+        A table (or Lakebase) location is loaded via *DQActionManager.load_actions*; any other location
+        is treated as a workspace/volume/local file and loaded via *load_actions_from_local_file*.
+
+        Args:
+            run_config: The run configuration whose *actions_location* is loaded.
+
+        Returns:
+            The loaded *DQAction* instances, or an empty list when no location is configured.
+        """
+        location = run_config.actions_location
+        if not location:
+            return []
+        storage_config = self._run_config_actions_storage_config(run_config)
+        manager = DQActionManager(ws=self.ws, spark=self.spark)
+        if storage_config is not None:
+            return manager.load_actions(storage_config)
+        return DQActionManager.load_actions_from_local_file(location)
+
+    @staticmethod
+    def _run_config_actions_storage_config(
+        run_config: RunConfig,
+    ) -> TableActionsStorageConfig | LakebaseActionsStorageConfig | None:
+        """Resolve the definitions storage config for *run_config.actions_location*.
+
+        Returns *None* when the location is empty or is a file path (loaded via the local-file reader
+        rather than a table backend).
+
+        Args:
+            run_config: The run configuration whose *actions_location* is resolved.
+
+        Returns:
+            A *LakebaseActionsStorageConfig* when the location is a table and Lakebase connection
+            params are set, a *TableActionsStorageConfig* for a plain table location, or *None* for a
+            file/empty location (loaded via the local-file reader).
+        """
+        location = run_config.actions_location
+        # A non-table location is a workspace/volume/local file loaded via load_actions_from_local_file;
+        # the table backends (including Lakebase) only apply to table locations. Checking this before the
+        # Lakebase branch prevents a file path from being wrapped in a table config when Lakebase is set.
+        if not location or not is_table_location(location):
+            return None
+        if run_config.lakebase_instance_name:
+            return LakebaseActionsStorageConfig(
+                location=location,
+                instance_name=run_config.lakebase_instance_name,
+                client_id=run_config.lakebase_client_id,
+                port=run_config.lakebase_port or "5432",
+                run_config_name=run_config.name,
+            )
+        return TableActionsStorageConfig(location=location, run_config_name=run_config.name)
+
+    @staticmethod
+    def _run_config_action_events_config(
+        run_config: RunConfig,
+    ) -> ActionEventsConfig | LakebaseActionsStorageConfig | None:
+        """Resolve the event-store config for *run_config.action_events_location*.
+
+        Args:
+            run_config: The run configuration whose *action_events_location* is resolved.
+
+        Returns:
+            A *LakebaseActionsStorageConfig* when Lakebase connection params are set, an
+            *ActionEventsConfig* for a UC table, or *None* when no events location is configured.
+
+        Raises:
+            InvalidConfigError: If *action_events_location* is set to a non-table (file) location;
+                action events are always written to a Unity Catalog or Lakebase table.
+        """
+        location = run_config.action_events_location
+        if not location:
+            return None
+        # Both config types validate that the location is a table (not a file) at construction, so a
+        # file location is rejected regardless of which backend branch is taken here.
+        if run_config.lakebase_instance_name:
+            return LakebaseActionsStorageConfig(
+                location=location,
+                instance_name=run_config.lakebase_instance_name,
+                client_id=run_config.lakebase_client_id,
+                port=run_config.lakebase_port or "5432",
+                run_config_name=run_config.name,
+            )
+        return ActionEventsConfig(location=location, run_config_name=run_config.name)
 
     @staticmethod
     def _wait_for_one_time_trigger_streaming_queries(

@@ -6,8 +6,6 @@ validation, and conversion of observed ``check_metrics`` JSON into the
 legacy ``error_summary`` shape.
 """
 
-from __future__ import annotations
-
 import json
 import sys
 from pathlib import Path
@@ -394,22 +392,21 @@ class TestWriteSqlQuarantineRecords:
         df.limit.assert_called_once_with(100)
         chain.writeTo.assert_called_once()
 
-    def test_synthetic_errors_payload_uses_check_name_key(self, runner_module):
+    def test_synthetic_errors_payload_matches_dqx_result_schema(self, runner_module):
         # The errors JSON written into ``dq_quarantine_records.errors``
-        # must mirror the column-check format: ``{<check_name>: <message>}``.
-        # We can't introspect the Spark expression directly, but we can
-        # verify the constant payload that's threaded into ``F.lit(...)``
-        # by capturing the lit() argument from a hand-rolled spy on
-        # ``pyspark.sql.functions``.
-        # Rather than monkey-patching pyspark, just verify the Python
-        # constant we emit by re-constructing it deterministically.
-        synth = json.dumps({"my_sql_check": "SQL check violation"})
-        # Re-invoke the same json serialiser the runner uses (it reuses
-        # ``_json_dumps`` so dates/decimals are stable). For a plain
-        # dict this is the same as ``json.dumps``.
-        re_synth = runner_module._json_dumps({"my_sql_check": "SQL check violation"})
-        assert json.loads(synth) == json.loads(re_synth)
-        assert json.loads(re_synth) == {"my_sql_check": "SQL check violation"}
+        # must mirror DQX's ``dq_result_item_schema`` — a list of
+        # ``{name, message, ...}`` structs — so:
+        #   * the Pydantic ``QuarantineRecordOut.errors: list[Any]``
+        #     validates without coercion,
+        #   * the frontend's ``row.errors.map(formatError)`` renders the
+        #     same way as row-level check errors,
+        #   * legacy ``{check_name: message}`` dict-shape rows still
+        #     work via the back-compat coercion in
+        #     ``quarantine._row_to_record``.
+        re_synth = runner_module._json_dumps([{"name": "my_sql_check", "message": "SQL check violation"}])
+        decoded = json.loads(re_synth)
+        assert isinstance(decoded, list)
+        assert decoded == [{"name": "my_sql_check", "message": "SQL check violation"}]
 
     def test_max_rows_constant_default_matches_module(self, runner_module):
         # Regression guard: the function default must mirror the module
@@ -429,3 +426,153 @@ class TestWriteSqlQuarantineRecords:
         from databricks_labs_dqx_app.backend.routes.v1 import quarantine as q
 
         assert cap >= q._EXPORT_MAX_ROWS
+
+
+# ---------------------------------------------------------------------------
+# _parse_job_run_id — {{job.run_id}} run-context parsing (B2-69)
+# ---------------------------------------------------------------------------
+
+
+class TestParseJobRunId:
+    def test_none_and_empty_return_none(self, runner_module):
+        assert runner_module._parse_job_run_id(None) is None
+        assert runner_module._parse_job_run_id("") is None
+        assert runner_module._parse_job_run_id("   ") is None
+
+    def test_numeric_string_parses(self, runner_module):
+        assert runner_module._parse_job_run_id("123456") == 123456
+
+    def test_surrounding_whitespace_tolerated(self, runner_module):
+        assert runner_module._parse_job_run_id("  789 ") == 789
+
+    def test_unresolved_template_reference_returns_none(self, runner_module):
+        # If the {{job.run_id}} reference is not substituted (local run, SDK
+        # drift) we must not persist the literal — treat it as absent.
+        assert runner_module._parse_job_run_id("{{job.run_id}}") is None
+
+    def test_non_numeric_returns_none(self, runner_module):
+        assert runner_module._parse_job_run_id("abc") is None
+        assert runner_module._parse_job_run_id("12x") is None
+
+
+# ---------------------------------------------------------------------------
+# _stamp_run_provenance — terminal-row field population (B2-69)
+# ---------------------------------------------------------------------------
+
+
+class TestStampRunProvenance:
+    """The task runner appends a fresh terminal row; this helper stamps the
+    provenance columns the Runs-History UI reads off it: ``created_at``,
+    ``updated_at`` (duration source for validation runs) and ``job_run_id``
+    (the "Run" deep-link).
+    """
+
+    def _mock_df(self):
+        df = MagicMock(name="result_row")
+        df.withColumn.return_value = df  # chainable
+        return df
+
+    def _stamped_columns(self, df) -> list[str]:
+        return [call.args[0] for call in df.withColumn.call_args_list]
+
+    def test_stamps_created_updated_and_job_run_id(self, runner_module):
+        df = self._mock_df()
+        out = runner_module._stamp_run_provenance(df, job_run_id=42, duration_seconds=1.5)
+        cols = self._stamped_columns(df)
+        assert "updated_at" in cols
+        assert "created_at" in cols
+        assert "job_run_id" in cols
+        assert out is df
+
+    def test_omits_job_run_id_when_none(self, runner_module):
+        # A missing run context must leave job_run_id unset (NULL) rather than
+        # writing a bogus value — but timestamps are always stamped.
+        df = self._mock_df()
+        runner_module._stamp_run_provenance(df, job_run_id=None, duration_seconds=None)
+        cols = self._stamped_columns(df)
+        assert "job_run_id" not in cols
+        assert "created_at" in cols
+        assert "updated_at" in cols
+
+    def test_zero_duration_still_stamps_created_at(self, runner_module):
+        # duration_seconds=None / 0 collapses created_at to the completion
+        # instant, but the column must still be present.
+        df = self._mock_df()
+        runner_module._stamp_run_provenance(df, job_run_id=None, duration_seconds=0)
+        assert "created_at" in self._stamped_columns(df)
+
+
+# ---------------------------------------------------------------------------
+# _write_error — run_type tagging on the FAILED row
+# ---------------------------------------------------------------------------
+
+
+class TestWriteErrorRunType:
+    """The FAILED row must carry the SUBMITTER's run_type, not the task_type.
+
+    Every app-submitted check run is submitted as ``task_type="dryrun"``;
+    manual-vs-scheduled travels separately in the job config. Deriving the tag
+    from ``task_type`` recorded a failed scheduled run as ``dryrun``, so Runs
+    History labelled it "Manual".
+    """
+
+    def _written_row(self, spark) -> dict:
+        """Zip the written tuple against its schema so asserts aren't positional."""
+        rows = spark.createDataFrame.call_args.args[0]
+        schema = spark.createDataFrame.call_args.kwargs["schema"]
+        names = [field.strip().rsplit(" ", 1)[0] for field in schema.split(",")]
+        return dict(zip(names, rows[0]))
+
+    def _write(self, runner_module, **kwargs) -> dict:
+        spark = MagicMock(name="spark")
+        runner_module._write_error(
+            spark,
+            kwargs.pop("task_type", "dryrun"),
+            "cat",
+            "sch",
+            "run1",
+            "alice@example.com",
+            "cat.sch.tbl",
+            "cat.tmp.view",
+            "boom",
+            **kwargs,
+        )
+        return self._written_row(spark)
+
+    def test_config_run_type_wins_over_task_type(self, runner_module):
+        # The scheduler fires binding runs as task_type="dryrun" with
+        # run_type="scheduled" in the config — the row must say "scheduled".
+        row = self._write(runner_module, task_type="dryrun", run_type="scheduled")
+        assert row["run_type"] == "scheduled"
+        assert row["status"] == "FAILED"
+
+    def test_manual_run_stays_dryrun(self, runner_module):
+        row = self._write(runner_module, task_type="dryrun", run_type="dryrun")
+        assert row["run_type"] == "dryrun"
+
+    def test_task_type_is_the_fallback_when_config_omits_run_type(self, runner_module):
+        # Callers that submit "scheduled" directly pass no config run_type.
+        assert self._write(runner_module, task_type="scheduled")["run_type"] == "scheduled"
+        assert self._write(runner_module, task_type="dryrun")["run_type"] == "dryrun"
+
+    def test_skip_history_still_forces_preview(self, runner_module):
+        # A preview must never be tagged as history, whatever the config says.
+        row = self._write(runner_module, task_type="dryrun", run_type="scheduled", skip_history=True)
+        assert row["run_type"] == "preview"
+
+
+# ---------------------------------------------------------------------------
+# _is_permission_denied — quiet the redundant SP-side DROP (B2-70)
+# ---------------------------------------------------------------------------
+
+
+class TestIsPermissionDenied:
+    def test_matches_permission_denied_text(self, runner_module):
+        exc = RuntimeError("PERMISSION_DENIED: User does not have MANAGE on Table 'cat.dqx_studio_tmp.tmp_view_abc'")
+        assert runner_module._is_permission_denied(exc) is True
+
+    def test_matches_manage_phrase_case_insensitive(self, runner_module):
+        assert runner_module._is_permission_denied(Exception("user does not have manage on table")) is True
+
+    def test_unrelated_error_is_not_permission_denied(self, runner_module):
+        assert runner_module._is_permission_denied(RuntimeError("connection reset by peer")) is False

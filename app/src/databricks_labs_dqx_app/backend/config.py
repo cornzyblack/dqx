@@ -29,13 +29,48 @@ class AppConfig(BaseSettings):
     catalog: str = Field(default="dqx")
     schema_name: str = Field(default="dqx_studio", validation_alias="DQX_SCHEMA")
     tmp_schema_name: str = Field(default="dqx_studio_tmp", validation_alias="DQX_TMP_SCHEMA")
+    genie_schema_name: str = Field(default="genie", validation_alias="DQX_GENIE_SCHEMA")
     job_id: str = Field(default="", validation_alias="DQX_JOB_ID")
     wheels_volume: str = Field(default="", validation_alias="DQX_WHEELS_VOLUME")
+    # Production deploys bind ``job_id`` and ``wheels_volume`` from
+    # bundle resources, so missing values there indicate a misconfigured
+    # deploy that would otherwise silently break profiler / dry-run /
+    # schedules at first use. Setting ``DQX_REQUIRE_TASK_RUNNER=1``
+    # promotes the missing-env warnings in :func:`backend.app.lifespan`
+    # to fail-fast startup errors. Leave unset (default) for local dev
+    # so the API can still boot without the task-runner wheels.
+    require_task_runner: bool = Field(
+        default=False,
+        validation_alias="DQX_REQUIRE_TASK_RUNNER",
+        description="Require DQX_JOB_ID and DQX_WHEELS_VOLUME at startup (production deploys).",
+    )
     llm_endpoint: str = Field(default="databricks-claude-sonnet-4-5", validation_alias="DQX_LLM_ENDPOINT")
+    # Hard cap on tokens generated per LLM call. Bounds cost/latency and
+    # mitigates LLM denial-of-service from pathological prompts (OWASP LLM04);
+    # rule-generation responses are small JSON payloads, so this is generous.
+    llm_max_tokens: int = Field(
+        default=4096,
+        validation_alias="DQX_LLM_MAX_TOKENS",
+        gt=0,
+        description="Maximum output tokens per ChatDatabricks call (LLM budget cap).",
+    )
     admin_group: str | None = Field(
         default=None,
         validation_alias="DQX_ADMIN_GROUP",
         description="Databricks workspace group name for bootstrap Admin access",
+    )
+    # Registered Databricks App slug — the unique per-workspace name the app is
+    # registered under (e.g. "dqx-studio"). Distinct from ``app_name`` which is
+    # the human-readable display title ("DQX Studio"). Used by the
+    # privileged-principals endpoint to call ``apps.get_permissions(slug)``.
+    # Resolution order: DQX_APP_NAME env var → DATABRICKS_APP_NAME (injected by
+    # the Apps runtime) → "dqx-studio" (default matching the bundle var default).
+    app_slug_name: str = Field(
+        default_factory=lambda: (
+            os.environ.get("DQX_APP_NAME") or os.environ.get("DATABRICKS_APP_NAME") or "dqx-studio"
+        ),
+        validation_alias="DQX_APP_NAME",
+        description="Registered Databricks App slug used for app-permissions lookups.",
     )
     profiler_max_sample_limit: int = Field(default=100_000)
     profiler_default_sample_limit: int = Field(default=50_000)
@@ -45,7 +80,7 @@ class AppConfig(BaseSettings):
     # ------------------------------------------------------------------
     # Lakebase (Postgres) backend
     # ------------------------------------------------------------------
-    # When ``lakebase_instance_name`` is set the OLTP-style tables
+    # When ``lakebase_endpoint`` is set the OLTP-style tables
     # (rules catalog, app settings, RBAC, comments, schedule configs,
     # scheduler bookkeeping) are routed to a Lakebase Postgres instance
     # instead of Delta. Bulk/append-only tables (validation runs,
@@ -55,10 +90,21 @@ class AppConfig(BaseSettings):
     # Leaving these empty keeps the legacy "everything on Delta"
     # behaviour, so existing deployments continue to work without
     # changes.  See ``app/databricks.yml`` for the deploy-time toggle.
-    lakebase_instance_name: str = Field(
+    lakebase_endpoint: str = Field(
         default="",
-        validation_alias="DQX_LAKEBASE_INSTANCE_NAME",
-        description="Lakebase instance name. Empty disables Lakebase routing.",
+        validation_alias="DQX_LAKEBASE_ENDPOINT",
+        description=(
+            "Lakebase endpoint resource path (Postgres *projects* model), "
+            "e.g. ``projects/dqx-studio-db/branches/dev/endpoints/primary``. "
+            "The single connection input: it drives both host resolution "
+            "(``postgres.get_endpoint``) and OAuth credential issuance "
+            "(``postgres.generate_database_credential``). Empty — or any of "
+            "the sentinel values ``-`` / ``disabled`` / ``off`` / ``none`` "
+            "(case-insensitive) — disables Lakebase routing and falls back "
+            "to Delta. The sentinel form exists because Databricks Apps "
+            "rejects env vars with an empty ``value`` string, so deployments "
+            "that want to disable Lakebase must pass a non-empty placeholder."
+        ),
     )
     # Default must match the ``lakebase_database_name`` bundle var in
     # ``app/databricks.yml`` (``databricks_postgres`` — the always-present
@@ -135,18 +181,35 @@ class AppConfig(BaseSettings):
     def static_assets_path(self) -> Path:
         return Path(str(resources.files(app_slug))).joinpath("__dist__")
 
+    # Sentinel values that explicitly disable Lakebase routing even
+    # though the env var has to be non-empty (Databricks Apps rejects
+    # ``value: ""``). Comparison is case-insensitive after stripping.
+    _LAKEBASE_DISABLED_SENTINELS = frozenset({"", "-", "disabled", "off", "none"})
+
     @property
     def lakebase_enabled(self) -> bool:
         """``True`` when the deployment was provisioned with Lakebase.
 
         Falls back to ``False`` (legacy UC-only mode) when the
-        instance name is empty so existing tests and dev setups keep
-        working with no Postgres dependency.
+        endpoint path is empty or set to a recognised "disabled"
+        sentinel so existing tests, dev setups, and Lakebase-less
+        Databricks Apps deployments keep working with no Postgres
+        dependency.
         """
-        return bool(self.lakebase_instance_name.strip())
+        return self.lakebase_endpoint.strip().lower() not in self._LAKEBASE_DISABLED_SENTINELS
 
 
 conf = AppConfig()
+
+
+# Maximum number of sample table rows fed into an AI/LLM prompt (e.g. the AI
+# rule generator's optional sample-row context). Mirrors the 500-row sample the
+# "ask a question about this data" path already uses
+# (services.table_data_service.TableDataService.PREVIEW_LIMIT), so every place
+# that samples table data for an AI/LLM question caps at the same 500 rows.
+# Still a hard, finite bound (OWASP LLM04/LLM06): it limits prompt size and the
+# volume of raw data echoed into a model call.
+AI_SAMPLE_ROW_LIMIT = 500
 
 
 def get_sql_warehouse_path() -> str:

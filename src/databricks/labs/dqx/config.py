@@ -1,6 +1,9 @@
-import abc
+import re
+from abc import ABC
 from dataclasses import asdict, dataclass, field
-from functools import cached_property
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from databricks.labs.dqx.checks_serializer import SerializerFactory
 from databricks.labs.dqx.errors import InvalidConfigError, InvalidParameterError
@@ -27,7 +30,67 @@ __all__ = [
     "LakebaseChecksStorageConfig",
     "InstallationChecksStorageConfig",
     "VolumeFileChecksStorageConfig",
+    "DQSecret",
+    "TableActionsStorageConfig",
+    "LakebaseActionsStorageConfig",
+    "ActionEventsConfig",
 ]
+
+
+@dataclass(frozen=True)
+class DQSecret:
+    """A reference to a Databricks secret stored in a secret scope.
+
+    Provides a canonical *scope/key* string representation that can be passed as
+    a credential reference in DQX configuration without embedding the secret
+    value in plain text.
+
+    Resolves against **classic Databricks workspace secret scopes** (the
+    *dbutils.secrets* / Secrets API), **not** Unity Catalog secrets. The value is
+    read at delivery time from the workspace that the engine's *WorkspaceClient*
+    targets, so the scope and key must exist in that same workspace.
+
+    Args:
+        scope: The Databricks secret scope name.
+        key: The key within the secret scope.
+    """
+
+    scope: str
+    key: str
+
+    def as_reference(self) -> str:
+        """Return the canonical *scope/key* reference string.
+
+        Returns:
+            A string of the form ``scope/key``.
+        """
+        return f"{self.scope}/{self.key}"
+
+    @classmethod
+    def from_reference(cls, ref: str) -> "DQSecret":
+        """Parse a *scope/key* reference string into a *DQSecret*.
+
+        The string is split on the **first** ``/`` only, so a key that itself
+        contains slashes is handled correctly.
+
+        Args:
+            ref: A reference string in the form ``scope/key``.
+
+        Returns:
+            A new *DQSecret* instance.
+
+        Raises:
+            InvalidParameterError: If *ref* does not contain a ``/``, or if
+                either the scope or key part is empty.
+        """
+        if "/" not in ref:
+            raise InvalidParameterError(f"Secret reference must be in the form 'scope/key', got {ref!r}.")
+        raw_scope, _, raw_key = ref.partition("/")
+        scope = raw_scope.strip()
+        key = raw_key.strip()
+        if not scope or not key:
+            raise InvalidParameterError(f"Secret reference must have non-empty scope and key parts, got {ref!r}.")
+        return cls(scope=scope, key=key)
 
 
 @dataclass
@@ -75,8 +138,12 @@ class ProfilerConfig:
     """Configuration class for profiler."""
 
     summary_stats_file: str = "profile_summary_stats.yml"  # file containing profile summary statistics
-    sample_fraction: float = 0.3  # fraction of data to sample (30%)
+    # fraction of data to sample; can be a uniform proportion or a mapping of
+    # sample_by_column values to their respective proportions
+    sample_fraction: float | dict[object, float] | None = 0.3
     sample_seed: int | None = None  # seed for sampling
+    sample_by_column: str | None = None  # column with keys to sample by
+    sample_by_values_limit: int = 1000  # max distinct sample_by_column values to collect when sampling uniformly
     limit: int = 1000  # limit the number of records to profile
     filter: str | None = None  # filter to apply to the data before profiling
     criticality: str = "error"  # default criticality for generated rules ("error" or "warn")
@@ -86,6 +153,7 @@ class ProfilerConfig:
     # Override profiler default thresholds
     max_null_ratio: float | None = None
     max_empty_ratio: float | None = None
+    outliers_ratio: float | None = None
 
 
 @dataclass
@@ -189,17 +257,53 @@ class RunConfig:
     lakebase_client_id: str | None = None
     lakebase_port: str | None = None
 
+    # UC/Lakebase table (or workspace/volume file) holding action definitions to auto-load and apply
+    # during workflow runs. None disables actions for this run config.
+    actions_location: str | None = None
+    # UC/Lakebase table for action event history and durable alert suppression across runs.
+    # None keeps alert suppression state in-memory only (resets each run).
+    action_events_location: str | None = None
+
 
 @dataclass
 class LLMModelConfig:
     """Configuration for LLM model"""
 
-    # The model to use for the DSPy language model
+    # The model to use. For AI explanations this resolves to a Databricks Model Serving endpoint
+    # name (the ``databricks/`` provider prefix, if present, is stripped before the ai_query call).
     model_name: str = "databricks/databricks-claude-sonnet-4-5"
-    # Optional API key for the model as text or secret scope/key. Not required by foundational models
+    # Optional API key for the model as text or secret scope/key. Not required by foundational models.
     api_key: str = ""  # when used with Profiler Workflow, this should be a secret: secret_scope/secret_key
-    # Optional API base URL for the model. Not required by foundational models
-    api_base: str = ""  # when used with Profiler Workflow, this should be a secret: secret_scope/secret_key
+    # Optional API base URL for the model. Not required by foundational models. Used by the LLM
+    # rule-generation / profiler path; the anomaly AI-explanation path runs via Spark SQL
+    # ``ai_query`` against a Databricks Model Serving endpoint resolved from *model_name* and does
+    # not use *api_base*. When used with Profiler Workflow, this can be a secret scope/key reference.
+    #
+    # This URL is passed to the outbound LLM client (litellm via DSPy) on
+    # the rule-generation path, so it must be a trusted, admin-controlled endpoint — a Databricks
+    # Model Serving / AI Gateway URL or a known OpenAI-compatible host — supplied via deployment
+    # config or a secret reference. Do NOT populate it from untrusted or end-user input, and do not
+    # point it at arbitrary internal hosts; doing so lets the profiler job issue requests to that
+    # target. Prefer HTTPS endpoints.
+    api_base: str = ""
+    # Per-call output token cap. Bounds cost and latency for pathological prompts (OWASP LLM04).
+    max_tokens: int = 1000
+    # Sampling temperature. 0.0 is deterministic; raise for more creative narratives.
+    temperature: float = 0.0
+    # Per-call wall-clock timeout in seconds.
+    timeout: float = 30.0
+    # Number of retries on transient LLM-call failures (used by the LLM rule-generation path). The
+    # AI-explanation path runs through Spark SQL ``ai_query`` against Databricks Model Serving, which
+    # handles retries internally and does not expose the count.
+    max_retries: int = 3
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool) or self.max_retries < 0:
+            raise InvalidParameterError(f"max_retries must be a non-negative integer, got {self.max_retries!r}")
+        if not isinstance(self.max_tokens, int) or isinstance(self.max_tokens, bool) or self.max_tokens <= 0:
+            raise InvalidParameterError(f"max_tokens must be a positive integer, got {self.max_tokens!r}")
+        if not isinstance(self.temperature, (int, float)) or isinstance(self.temperature, bool) or self.temperature < 0:
+            raise InvalidParameterError(f"temperature must be a non-negative number, got {self.temperature!r}")
 
 
 @dataclass(frozen=True)
@@ -293,18 +397,82 @@ class WorkspaceConfig:
         raise InvalidConfigError("No run configurations available")
 
 
-@dataclass
-class BaseChecksStorageConfig(abc.ABC):
+# Matches a two- or three-part table identifier (optional catalog), each part a bare or
+# backtick-quoted name: e.g. catalog.schema.table, schema.table, cat.sch.`weird.name`.
+# Databricks permits leading digits in unquoted identifiers (e.g. `1abc` is a valid table name;
+# verified against a live workspace), so a bare part is [a-zA-Z0-9_]+; special characters must be
+# backtick-quoted.
+_IDENT = r"(?:`[^`]+`|[a-zA-Z0-9_]+)"
+TABLE_PATTERN = re.compile(rf"^(?:{_IDENT}\.)?{_IDENT}\.{_IDENT}$")
+# A three-part table identifier only (catalog.schema.table), i.e. a namespace resolvable through the
+# Unity Catalog tables API. Unlike TABLE_PATTERN, the catalog part is required.
+UC_TABLE_PATTERN = re.compile(rf"^{_IDENT}\.{_IDENT}\.{_IDENT}$")
+
+
+def is_table_location(location: str) -> bool:
+    """Return True if *location* is a Delta table name (catalog.schema.table), not a file path.
+
+    A location is a table when it matches the table-identifier pattern AND does not end with a known
+    checks-serializer file extension (.json/.yml/...). This is the single source of truth for the
+    table-vs-file distinction; *io.py* and *checks_storage.py* re-export it.
+
+    Args:
+        location: The location string to classify.
+
+    Returns:
+        True if *location* names a table, False if it is a file path or otherwise not a table.
+    """
+    return bool(TABLE_PATTERN.match(location)) and not location.lower().endswith(
+        SerializerFactory.get_supported_extensions()
+    )
+
+
+def _is_three_part_table_location(location: str) -> bool:
+    """Return True if *location* is a table (not a file) with an exact three-part name.
+
+    Stricter than *is_table_location* (which also accepts the two-part *schema.table* form): Lakebase
+    requires a fully qualified *database.schema.table*.
+    """
+    return is_table_location(location) and len(location.split(".")) == 3
+
+
+class BaseChecksStorageConfig(BaseModel, ABC):
     """Marker base class for storage configuration.
 
     Args:
         location: The file path or table name where checks are stored.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     location: str
 
+    def __init__(self, **data: Any) -> None:
+        try:
+            super().__init__(**data)
+        except ValidationError as exc:
+            raise InvalidConfigError(str(exc)) from exc
 
-@dataclass
+    def replace(self, **changes: Any) -> "BaseChecksStorageConfig":
+        """Return a new config instance with the given field overrides, fully re-validated.
+
+        Unlike *model_copy(update=...)*, which shallow-copies the instance and skips all
+        validators, this rebuilds the config through the constructor so the *model_validator*
+        checks (e.g. *mode* and *location* format) re-run against the updated fields. Use this
+        instead of *model_copy* when overriding fields, so an invalid override is rejected at
+        the point of the change rather than failing later during a save/load operation.
+
+        Args:
+            **changes: Field values to override on the new instance.
+
+        Returns:
+            A new, fully validated config of the same concrete type.
+        """
+        fields = {name: getattr(self, name) for name in type(self).model_fields}
+        fields.update(changes)
+        return type(self)(**fields)
+
+
 class FileChecksStorageConfig(BaseChecksStorageConfig):
     """
     Configuration class for storing checks in a file.
@@ -313,14 +481,20 @@ class FileChecksStorageConfig(BaseChecksStorageConfig):
         location: The file path where the checks are stored.
     """
 
-    location: str
-
-    def __post_init__(self):
-        if not self.location:
+    @model_validator(mode='before')
+    @classmethod
+    def validate_location(cls, data: Any) -> Any:
+        # `cls is FileChecksStorageConfig` intentionally excludes subclasses.
+        # InstallationChecksStorageConfig uses diamond inheritance from this class and
+        # WorkspaceFileChecksStorageConfig; both validators are inherited and would fire
+        # for any subclass without the exact-class guard, giving confusing duplicate errors.
+        # InstallationChecksStorageConfig has its own validate_installation_location that
+        # covers the empty-location case for itself.
+        if cls is FileChecksStorageConfig and isinstance(data, dict) and not data.get("location"):
             raise InvalidConfigError("The file path ('location' field) must not be empty or None.")
+        return data
 
 
-@dataclass
 class WorkspaceFileChecksStorageConfig(BaseChecksStorageConfig):
     """
     Configuration class for storing checks in a workspace file.
@@ -329,14 +503,15 @@ class WorkspaceFileChecksStorageConfig(BaseChecksStorageConfig):
         location: The workspace file path where the checks are stored.
     """
 
-    location: str
-
-    def __post_init__(self):
-        if not self.location:
+    @model_validator(mode='before')
+    @classmethod
+    def validate_location(cls, data: Any) -> Any:
+        # See FileChecksStorageConfig.validate_location for why the exact-class guard is needed.
+        if cls is WorkspaceFileChecksStorageConfig and isinstance(data, dict) and not data.get("location"):
             raise InvalidConfigError("The workspace file path ('location' field) must not be empty or None.")
+        return data
 
 
-@dataclass
 class TableChecksStorageConfig(BaseChecksStorageConfig):
     """
     Configuration class for storing checks in a table.
@@ -354,17 +529,19 @@ class TableChecksStorageConfig(BaseChecksStorageConfig):
             When None (default), loads the latest batch.
     """
 
-    location: str
     run_config_name: str = "default"  # to filter checks by run config
     mode: str = "append"
     rule_set_fingerprint: str | None = None  # to filter checks by rule set fingerprint
 
-    def __post_init__(self):
-        if not self.location:
+    @model_validator(mode='before')
+    @classmethod
+    def validate_location(cls, data: Any) -> Any:
+        # See FileChecksStorageConfig.validate_location for why the exact-class guard is needed.
+        if cls is TableChecksStorageConfig and isinstance(data, dict) and not data.get("location"):
             raise InvalidConfigError("The table name ('location' field) must not be empty or None.")
+        return data
 
 
-@dataclass
 class LakebaseChecksStorageConfig(BaseChecksStorageConfig):
     """
     Configuration class for storing checks in a Lakebase table.
@@ -385,7 +562,6 @@ class LakebaseChecksStorageConfig(BaseChecksStorageConfig):
             When None (default), loads the latest batch.
     """
 
-    location: str
     instance_name: str | None = None
     client_id: str | None = None
     port: str = "5432"
@@ -393,14 +569,23 @@ class LakebaseChecksStorageConfig(BaseChecksStorageConfig):
     mode: str = "append"
     rule_set_fingerprint: str | None = None
 
-    def __post_init__(self):
-        if not self.location or self.location == "":
+    @model_validator(mode='before')
+    @classmethod
+    def validate_location_present(cls, data: Any) -> Any:
+        if cls is LakebaseChecksStorageConfig and isinstance(data, dict) and not data.get("location"):
             raise InvalidParameterError("Location must not be empty or None.")
+        return data
 
-        if not self.instance_name or self.instance_name == "":
+    @model_validator(mode='after')
+    def validate_lakebase_config(self) -> 'LakebaseChecksStorageConfig':
+        if self.__class__ is not LakebaseChecksStorageConfig:
+            return self
+
+        if not self.instance_name:
             raise InvalidParameterError("Instance name must not be empty or None.")
 
-        if len(self.location.split(".")) != 3:
+        # Lakebase requires an exact three-part database.schema.table name that is a table, not a file.
+        if not _is_three_part_table_location(self.location):
             raise InvalidConfigError(
                 f"Invalid Lakebase table name '{self.location}'. Must be in the format 'database.schema.table'."
             )
@@ -408,26 +593,27 @@ class LakebaseChecksStorageConfig(BaseChecksStorageConfig):
         if self.mode not in ("append", "overwrite"):
             raise InvalidConfigError(f"Invalid mode '{self.mode}'. Must be 'append' or 'overwrite'.")
 
+        return self
+
     def _split_location(self) -> tuple[str, ...]:
         """Splits 'database.schema.table' into components."""
         if not self.location:
             raise InvalidConfigError("location must be set before accessing database components.")
         return tuple(self.location.split("."))
 
-    @cached_property
+    @property
     def database_name(self) -> str:
         return self._split_location()[0]
 
-    @cached_property
+    @property
     def schema_name(self) -> str:
         return self._split_location()[1]
 
-    @cached_property
+    @property
     def table_name(self) -> str:
         return self._split_location()[2]
 
 
-@dataclass
 class VolumeFileChecksStorageConfig(BaseChecksStorageConfig):
     """
     Configuration class for storing checks in a Unity Catalog volume file.
@@ -436,13 +622,19 @@ class VolumeFileChecksStorageConfig(BaseChecksStorageConfig):
         location: The Unity Catalog volume file path where the checks are stored.
     """
 
-    location: str
-
-    def __post_init__(self):
-        if not self.location:
+    @model_validator(mode='before')
+    @classmethod
+    def validate_location_present(cls, data: Any) -> Any:
+        if cls is VolumeFileChecksStorageConfig and isinstance(data, dict) and not data.get("location"):
             raise InvalidParameterError(
                 "The Unity Catalog volume file path ('location' field) must not be empty or None."
             )
+        return data
+
+    @model_validator(mode='after')
+    def validate_location(self) -> 'VolumeFileChecksStorageConfig':
+        if self.__class__ is not VolumeFileChecksStorageConfig:
+            return self
 
         # Expected format: /Volumes/{catalog}/{schema}/{volume}/{path/to/file}
         if not self.location.startswith("/Volumes/"):
@@ -459,8 +651,9 @@ class VolumeFileChecksStorageConfig(BaseChecksStorageConfig):
         if len(parts) < 6 or not parts[-1].lower().endswith(SerializerFactory.get_supported_extensions()):
             raise InvalidParameterError("Invalid path: Path must include a file name after the volume")
 
+        return self
 
-@dataclass
+
 class InstallationChecksStorageConfig(
     WorkspaceFileChecksStorageConfig,
     TableChecksStorageConfig,
@@ -490,3 +683,141 @@ class InstallationChecksStorageConfig(
     assume_user: bool = True
     install_folder: str | None = None
     overwrite_location: bool = False
+
+    @model_validator(mode='before')
+    @classmethod
+    def validate_installation_location(cls, data: Any) -> Any:
+        # Only guard against an explicitly empty/None location; an absent key keeps the default above.
+        if isinstance(data, dict) and "location" in data and not data["location"]:
+            raise InvalidConfigError("The workspace file path ('location' field) must not be empty or None.")
+        return data
+
+
+class TableActionsStorageConfig(BaseChecksStorageConfig):
+    """Configuration class for persisting DQ action definitions to a Unity Catalog table.
+
+    Args:
+        location: Fully qualified UC table name (e.g. *catalog.schema.table*) where action definitions are stored.
+        run_config_name: Name of the run configuration these actions belong to (default is *default*).
+        mode: Write mode for the table (*append* or *overwrite*, default *append*).
+    """
+
+    run_config_name: str = "default"
+    mode: str = "append"
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_location(cls, data: Any) -> Any:
+        if cls is TableActionsStorageConfig and isinstance(data, dict) and not data.get("location"):
+            raise InvalidConfigError("The table name ('location' field) must not be empty or None.")
+        return data
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "TableActionsStorageConfig":
+        if self.mode not in ("append", "overwrite"):
+            raise InvalidConfigError(f"Invalid mode '{self.mode}'. Must be 'append' or 'overwrite'.")
+        return self
+
+
+class LakebaseActionsStorageConfig(BaseChecksStorageConfig):
+    """Configuration class for persisting DQ action definitions to a Lakebase (PostgreSQL) table.
+
+    The *location* must be a fully qualified three-part name in the form *database.schema.table*.
+
+    Args:
+        location: Fully qualified Lakebase table name in the format *database.schema.table*.
+        instance_name: Name of the Lakebase instance.
+        client_id: ID of the Databricks service principal for the Lakebase connection.
+        port: Lakebase port (default is *5432*).
+        run_config_name: Name of the run configuration these actions belong to (default is *default*).
+        mode: Write mode for the table (*append* or *overwrite*, default *append*).
+    """
+
+    instance_name: str | None = None
+    client_id: str | None = None
+    port: str = "5432"
+    run_config_name: str = "default"
+    mode: str = "append"
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_location_present(cls, data: Any) -> Any:
+        if cls is LakebaseActionsStorageConfig and isinstance(data, dict) and not data.get("location"):
+            raise InvalidParameterError("Location must not be empty or None.")
+        return data
+
+    @model_validator(mode="after")
+    def validate_lakebase_config(self) -> "LakebaseActionsStorageConfig":
+        if not self.instance_name:
+            raise InvalidParameterError("Instance name must not be empty or None.")
+
+        # Lakebase requires an exact three-part database.schema.table name that is a table, not a file.
+        if not _is_three_part_table_location(self.location):
+            raise InvalidConfigError(
+                f"Invalid Lakebase table name '{self.location}'. Must be in the format 'database.schema.table'."
+            )
+
+        if self.mode not in ("append", "overwrite"):
+            raise InvalidConfigError(f"Invalid mode '{self.mode}'. Must be 'append' or 'overwrite'.")
+
+        return self
+
+    def _split_location(self) -> tuple[str, ...]:
+        """Splits *database.schema.table* into components."""
+        return tuple(self.location.split("."))
+
+    @property
+    def database_name(self) -> str:
+        """The database portion of the three-part location."""
+        return self._split_location()[0]
+
+    @property
+    def schema_name(self) -> str:
+        """The schema portion of the three-part location."""
+        return self._split_location()[1]
+
+    @property
+    def table_name(self) -> str:
+        """The table portion of the three-part location."""
+        return self._split_location()[2]
+
+
+class ActionEventsConfig(BaseChecksStorageConfig):
+    """Configuration class for storing DQ action events in a Unity Catalog table.
+
+    Args:
+        location: Fully qualified UC table name (e.g. *catalog.schema.events*) where action events are written.
+        mode: Reserved for API symmetry with the other storage configs. Action events form an
+            append-only audit log, so the events table is always appended to regardless of this value.
+        run_config_name: Run configuration the events belong to. Events are stamped with, and loaded
+            filtered by, this value so a shared events table keeps per-run-config alert suppression
+            independent (default is *default*).
+    """
+
+    mode: str = "append"
+    run_config_name: str = "default"
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_location(cls, data: Any) -> Any:
+        if cls is ActionEventsConfig and isinstance(data, dict) and not data.get("location"):
+            raise InvalidConfigError("The events table name ('location' field) must not be empty or None.")
+        return data
+
+    @model_validator(mode="after")
+    def validate_location_is_table(self) -> "ActionEventsConfig":
+        # Action events are always written to a Unity Catalog or Lakebase table, never a file. Validate
+        # here (at construction) so the guarantee holds regardless of how the config is built, rather
+        # than relying on a caller to check the location before constructing it.
+        if not is_table_location(self.location):
+            raise InvalidConfigError(
+                f"action_events_location '{self.location}' must be a Unity Catalog table "
+                "(catalog.schema.table) or a Lakebase table; file locations are not supported for action events."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "ActionEventsConfig":
+        if self.mode not in ("append", "overwrite"):
+            raise InvalidConfigError(f"Invalid mode '{self.mode}'. Must be 'append' or 'overwrite'.")
+        return self

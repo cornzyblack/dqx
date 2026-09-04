@@ -31,6 +31,14 @@ from databricks.labs.dqx.check_funcs import (
     has_valid_json_schema,
     is_valid_timestamp,
     is_valid_ipv4_address,
+    is_valid_email,
+    is_valid_url,
+    is_valid_uuid,
+    is_valid_national_id,
+    is_valid_country_code,
+    is_valid_currency_code,
+    is_valid_subdivision_code,
+    is_valid_language_code,
     is_ipv4_address_in_cidr,
     is_valid_ipv6_address,
     is_ipv6_address_in_cidr,
@@ -38,11 +46,121 @@ from databricks.labs.dqx.check_funcs import (
     is_null,
     is_empty,
     is_null_or_empty,
+    has_valid_string_case,
 )
 from databricks.labs.dqx.pii import pii_detection_funcs
 from databricks.labs.dqx.errors import InvalidParameterError
 
 SCHEMA = "a: string, b: int"
+
+
+def test_has_valid_string_case(spark):
+    test_df = spark.createDataFrame(
+        [
+            [
+                "UPPER",
+                "lower",
+                "Notes From IEEE Meeting",
+                "First segment. Second segment.",
+                {"value": "nested"},
+                123,
+            ],
+            [
+                "Upper",
+                "Lower",
+                "Notes from IEEE Meeting",
+                "first SEGMENT. second SEGMENT",
+                {"value": "Nested"},
+                None,
+            ],
+            [None, "", "   ", "123!?. #$", {"value": "nested"}, 123],
+            [" UPPER ", " lower ", " spark sql ", " first SEGMENT. second SEGMENT ", {"value": "nested"}, 123],
+            ["123!?", "123!?", "hello-world", "Hello 123!. Second segment", {"value": "NESTED"}, 123],
+            [
+                "UPPER",
+                "lower",
+                "Notes From The 4th IEEE Meeting",
+                "The first IEEE meeting was today. The 2nd IEEE meeting will be next month.",
+                {"value": "nested"},
+                123,
+            ],
+        ],
+        "upper: string, lower: string, title: string, sentence: string, nested: struct<value:string>, numeric: int",
+    )
+
+    actual = test_df.select(
+        has_valid_string_case("upper", "upper"),
+        has_valid_string_case("lower", "lower"),
+        has_valid_string_case("title", "title"),
+        has_valid_string_case("sentence", "sentence"),
+        has_valid_string_case(F.col("nested").getItem("value"), "lower"),
+        has_valid_string_case("numeric", "lower"),
+    )
+
+    def violation(value: str, column: str, case: str) -> str:
+        return f"Value '{value}' in Column '{column}' does not have valid '{case}' string case"
+
+    expected = spark.createDataFrame(
+        [
+            [None, None, None, None, None, None],
+            [
+                violation("Upper", "upper", "upper"),
+                violation("Lower", "lower", "lower"),
+                violation("Notes from IEEE Meeting", "title", "title"),
+                violation("first SEGMENT. second SEGMENT", "sentence", "sentence"),
+                violation("Nested", "nested['value']", "lower"),
+                None,
+            ],
+            [None, None, None, None, None, None],
+            [
+                None,
+                None,
+                violation(" spark sql ", "title", "title"),
+                violation(" first SEGMENT. second SEGMENT ", "sentence", "sentence"),
+                None,
+                None,
+            ],
+            [
+                None,
+                None,
+                violation("hello-world", "title", "title"),
+                None,
+                violation("NESTED", "nested['value']", "lower"),
+                None,
+            ],
+            [None, None, None, None, None, None],
+        ],
+        "upper_has_invalid_upper_string_case: string, "
+        "lower_has_invalid_lower_string_case: string, "
+        "title_has_invalid_title_string_case: string, "
+        "sentence_has_invalid_sentence_string_case: string, "
+        "nested_value_has_invalid_lower_string_case: string, "
+        "numeric_has_invalid_lower_string_case: string",
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_has_valid_string_case_all_uppercase_passes_title_and_sentence(spark):
+    """title/sentence only check the first character of each word/segment and leave the rest as-is,
+    so an all-uppercase value passes both (documented behavior). This pins that intentional quirk so a
+    future change (e.g. switching to full initcap title-casing) can't silently alter it."""
+    test_df = spark.createDataFrame(
+        [["HELLO WORLD", "HELLO WORLD. GOODBYE WORLD"]],
+        "title: string, sentence: string",
+    )
+
+    actual = test_df.select(
+        has_valid_string_case("title", "title"),
+        has_valid_string_case("sentence", "sentence"),
+    )
+
+    expected = spark.createDataFrame(
+        [[None, None]],
+        "title_has_invalid_title_string_case: string, sentence_has_invalid_sentence_string_case: string",
+    )
+
+    assertDataFrameEqual(actual, expected)
 
 
 def test_col_is_not_null_and_not_empty(spark):
@@ -356,13 +474,13 @@ def test_col_is_not_null_and_is_in_list(spark):
     )
 
     actual = test_df.select(
-        is_not_null_and_is_in_list("a", ["str1"]),
+        is_not_null_and_is_in_list("a", ["'str1'"]),
         is_not_null_and_is_in_list("b", [F.lit(3)]),
         is_not_null_and_is_in_list(F.col("c").getItem("val"), [F.lit("a")]),
-        is_not_null_and_is_in_list(F.try_element_at("d", F.lit(2)), ["b"]),
-        is_not_null_and_is_in_list("a", ["str1"], case_sensitive=False),
+        is_not_null_and_is_in_list(F.try_element_at("d", F.lit(2)), ["'b'"]),
+        is_not_null_and_is_in_list("a", ["'str1'"], case_sensitive=False),
         is_not_null_and_is_in_list(F.col("c").getItem("val"), [F.lit("a")], case_sensitive=False),
-        is_not_null_and_is_in_list(F.try_element_at("d", F.lit(2)), ["b"], case_sensitive=False),
+        is_not_null_and_is_in_list(F.try_element_at("d", F.lit(2)), ["'b'"], case_sensitive=False),
         is_not_null_and_is_in_list("d", [["a", "b"], ["B", "c"]]),
         is_not_null_and_is_in_list("d", [["a", "b"], ["B", "c"]], case_sensitive=False),
     )
@@ -456,13 +574,13 @@ def test_col_is_not_in_list(spark):
         input_schema,
     )
     actual = test_df.select(
-        is_in_list("a", ["str1"]),
+        is_in_list("a", ["'str1'"]),
         is_in_list("b", [F.lit(3)]),
         is_in_list(F.col("c").getItem("val"), [F.lit("a")]),
-        is_in_list(F.try_element_at("d", F.lit(2)), ["b"]),
-        is_in_list("a", ["str1"], case_sensitive=False),
+        is_in_list(F.try_element_at("d", F.lit(2)), ["'b'"]),
+        is_in_list("a", ["'str1'"], case_sensitive=False),
         is_in_list(F.col("c").getItem("val"), [F.lit("a")], case_sensitive=False),
-        is_in_list(F.try_element_at("d", F.lit(2)), ["b"], case_sensitive=False),
+        is_in_list(F.try_element_at("d", F.lit(2)), ["'b'"], case_sensitive=False),
         is_in_list("d", [["a", "b"], ["B", "c"]]),
         is_in_list("d", [["a", "b"], ["B", "c"]], case_sensitive=False),
     )
@@ -561,6 +679,60 @@ def test_col_is_not_null_and_is_in_list_mismatch_datatype(spark):
         actual.count()
 
 
+def test_col_is_not_in_list_resolves_bare_string_as_column_reference(spark):
+    """A bare (unquoted) string in the forbidden list resolves as a column expression, not a literal,
+    so a row is flagged when the checked column's value matches the referenced column's value."""
+    input_schema = "a: string, b: string"
+    test_df = spark.createDataFrame(
+        [
+            ["match", "match"],  # a == b -> in forbidden list -> flagged
+            ["x", "y"],  # a != b -> allowed
+        ],
+        input_schema,
+    )
+
+    actual = test_df.select(is_not_in_list("a", ["b"]))  # "b" is a column reference, not the literal "b"
+
+    checked_schema = "a_is_in_the_forbidden_list: string"
+    expected = spark.createDataFrame(
+        [
+            ["Value 'match' in Column 'a' is in the forbidden list: [match]"],
+            [None],
+        ],
+        checked_schema,
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_not_null_and_is_in_list_resolves_bare_string_as_column_reference(spark):
+    """A bare (unquoted) string in the allowed list resolves as a column expression, not a literal,
+    so a row passes only when the non-null checked column value matches the referenced column value."""
+    input_schema = "a: string, b: string"
+    test_df = spark.createDataFrame(
+        [
+            ["match", "match"],  # a == b and not null -> allowed
+            ["x", "y"],  # a != b -> not in allowed list -> flagged
+            [None, "y"],  # a is null -> flagged
+        ],
+        input_schema,
+    )
+
+    actual = test_df.select(is_not_null_and_is_in_list("a", ["b"]))  # "b" is a column reference
+
+    checked_schema = "a_is_null_or_is_not_in_the_list: string"
+    expected = spark.createDataFrame(
+        [
+            [None],
+            ["Value 'x' in Column 'a' is null or not in the allowed list: [y]"],
+            ["Value 'null' in Column 'a' is null or not in the allowed list: [y]"],
+        ],
+        checked_schema,
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
 def test_is_not_in_list(spark):
     """Test is_not_in_list check function - blacklist functionality."""
     input_schema = "a: string, b: int, c: map<string, string>, d: array<string>"
@@ -577,13 +749,13 @@ def test_is_not_in_list(spark):
 
     # Test with forbidden values - should fail when value IS in the forbidden list
     actual = test_df.select(
-        is_not_in_list("a", ["banned", "suspended", "deleted"]),
+        is_not_in_list("a", ["'banned'", "'suspended'", "'deleted'"]),
         is_not_in_list("b", [F.lit(99), F.lit(100)]),
         is_not_in_list(F.col("c").getItem("status"), [F.lit("banned"), F.lit("error")]),
-        is_not_in_list(F.try_element_at("d", F.lit(1)), ["admin", "root"]),
-        is_not_in_list("a", ["banned", "suspended"], case_sensitive=False),
+        is_not_in_list(F.try_element_at("d", F.lit(1)), ["'admin'", "'root'"]),
+        is_not_in_list("a", ["'banned'", "'suspended'"], case_sensitive=False),
         is_not_in_list(F.col("c").getItem("status"), [F.lit("ok")], case_sensitive=False),
-        is_not_in_list(F.try_element_at("d", F.lit(1)), ["admin"], case_sensitive=False),
+        is_not_in_list(F.try_element_at("d", F.lit(1)), ["'admin'"], case_sensitive=False),
         is_not_in_list("d", [["admin", "root"], ["DELETE", "write"]]),
         is_not_in_list("d", [["admin", "root"], ["DELETE", "write"]], case_sensitive=False),
     )
@@ -713,6 +885,36 @@ def test_col_sql_expression(spark):
                 "Illegal Arguments",
             ],
             ["Value is not matching expression: a = 'str2'", None, None, None, "Illegal Arguments"],
+        ],
+        checked_schema,
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_sql_expression_with_leading_comment(spark):
+    # Regression guard for the DQX Studio "SQL Explain" feature, which prepends
+    # the AI explanation to a rule predicate as `-- ...` comment lines (a blank
+    # line, then the logic). Spark's SQL lexer skips `--` line comments, so
+    # F.expr must evaluate a comment-prefixed expression identically to the bare
+    # expression AS LONG AS the terminating newline is preserved (it is — the
+    # app substitutes slots with str.replace, never collapsing whitespace). A
+    # comment whose prose contains a word like "delete" must not affect the
+    # result. If this ever fails, leading comments do NOT survive F.expr and the
+    # Studio must fall back to stripping comments before persisting.
+    test_df = spark.createDataFrame([["str1", 1, 1], ["str2", None, None], ["", 2, 3]], SCHEMA + ", c: string")
+
+    commented_expr = "-- delete stale rows where a is not str2\n-- second explanation line\n\na = 'str2'"
+    actual = test_df.select(
+        sql_expression(commented_expr, name="commented", msg="a is not str2"),
+    )
+
+    checked_schema = "commented: string"
+    expected = spark.createDataFrame(
+        [
+            ["a is not str2"],
+            [None],
+            ["a is not str2"],
         ],
         checked_schema,
     )
@@ -934,7 +1136,7 @@ def test_col_is_not_in_near_future(spark):
 
 def test_is_col_older_than_n_days_cur(spark):
     schema_dates = "a: string, b: map<string, string>"
-    cur_date = spark.sql("SELECT current_date() AS current_date").collect()[0]['current_date'].strftime("%Y-%m-%d")
+    cur_date = spark.sql("SELECT current_date() AS current_date").collect()[0]["current_date"].strftime("%Y-%m-%d")
 
     test_df = spark.createDataFrame(
         [["2023-01-10", {"dt": "2023-01-10"}], [None, {"dt": None}], [cur_date, {"dt": cur_date}]], schema_dates
@@ -1839,6 +2041,1138 @@ def test_col_is_valid_ipv4_address(spark):
         ],
         checked_schema,
     )
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_email(spark):
+    schema_email = "a: string"
+    local_part_at_char_limit = "a" * 64  # 64 characters total
+    quoted_local_at_char_limit = '"' + "a" * 62 + '"'  # 64 characters including the surrounding quotes
+    full_text_at_char_limit = "a" * 64 + "@" + "b" * 63 + "." + "b" * 63 + "." + "b" * 58 + ".co"  # 254 chars total
+
+    test_df = spark.createDataFrame(
+        [
+            ["user@example.com"],
+            ["User.Name+tag@sub.domain.org"],
+            ["a@b.cd"],  # minimum valid
+            ["1234567890@numbers.io"],  # all-numeric local
+            ["mixed.case@MixedCase.Org"],  # case variations
+            ["user@[IPv6:::::::::]"],  # NOTE: IPv6 validation based on regex currently passes validation
+            [local_part_at_char_limit + "@b.com"],  # unquoted local part at 64-characters
+            [quoted_local_at_char_limit + "@example.com"],  # quoted local part at 64-characters (incl. quotes)
+            [full_text_at_char_limit],  # exactly at 254-character limit for the full text
+            ['"a"@example.com'],
+            ['"a@b"@example.com'],  # "@" inside quoted local
+            ["user@[192.0.2.1]"],
+            ["user@[IPv6:2001:db8::1]"],
+            [".user@example.com"],  # leading "."
+            ["user.@example.com"],  # trailing "."
+            ["us..er@example.com"],  # consecutive "."
+            ["user@-example.com"],  # leading hyphen on label
+            ["user@example-.com"],  # trailing hyphen on label
+            ["user@.example.com"],  # empty subdomain label
+            ["user@example..com"],  # double "." in domain
+            ["user@example.c"],  # single character TLD
+            ["user@example.123"],  # numeric TLD
+            ["user@example"],  # no TLD
+            ["userexample.com"],  # no "@"
+            ["user@@example.com"],  # double "@"
+            ["user@"],  # missing domain
+            ["@example.com"],  # missing local part
+            ["plainaddress"],  # no "@" or "."
+            ["a" + local_part_at_char_limit + "@example.com"],  # unquoted local part more than 64 characters
+            [f'"{"a" + local_part_at_char_limit}"' + "@example.com"],  # quoted local part more than 64 characters
+            ["a" + full_text_at_char_limit],  # full text more than 268 characters
+            ["user@[999.0.0.1]"],  # invalid IPv4 octet
+            ["user@[256.0.0.1]"],  # IPv4 octet over 255
+            ["user@[]"],  # empty IP literal
+            ["user@[192.0.2.1"],  # missing closing bracket
+            ["user@localhost"],  # no TLD
+            ["missing@tld"],  # no domain "."
+            [None],  # Null - passes (no violation reported)
+        ],
+        schema_email,
+    )
+
+    actual = test_df.select(is_valid_email("a"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' does not match pattern 'EMAIL_ADDRESS'"
+
+    checked_schema = "a_does_not_match_pattern_email_address: string"
+    checked_data = [
+        # Valid (no violation reported)
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        # Invalid - dot-atom violations
+        [violation(".user@example.com")],
+        [violation("user.@example.com")],
+        [violation("us..er@example.com")],
+        # Invalid - LDH domain violations
+        [violation("user@-example.com")],
+        [violation("user@example-.com")],
+        [violation("user@.example.com")],
+        [violation("user@example..com")],
+        # Invalid - TLD constraints
+        [violation("user@example.c")],
+        [violation("user@example.123")],
+        [violation("user@example")],
+        # Invalid - structural
+        [violation("userexample.com")],
+        [violation("user@@example.com")],
+        [violation("user@")],
+        [violation("@example.com")],
+        [violation("plainaddress")],
+        # Invalid - length caps
+        [violation("a" + local_part_at_char_limit + "@example.com")],
+        [violation(f'"{"a" + local_part_at_char_limit}"' + "@example.com")],
+        [violation("a" + full_text_at_char_limit)],
+        # Invalid - IP-literal edge cases
+        [violation("user@[999.0.0.1]")],
+        [violation("user@[256.0.0.1]")],
+        [violation("user@[]")],
+        [violation("user@[192.0.2.1")],
+        # Pre-existing coverage retained
+        [violation("user@localhost")],
+        [violation("missing@tld")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_url(spark):
+    schema_url = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            # Valid - common web forms
+            ["https://example.com"],
+            ["http://example.com/"],
+            ["https://example.com/path/to/page"],
+            ["https://example.com/path?query=1&other=2"],
+            ["https://example.com/path?query=1#fragment"],
+            ["https://example.com#fragment"],
+            ["https://sub.domain.example.co.uk/a/b/c"],
+            ["HTTPS://EXAMPLE.COM"],  # scheme and host are case-insensitive
+            # Valid - authority components
+            ["https://user@example.com/p"],
+            ["https://user:pw@example.com:8080/p"],
+            ["https://example.com:8080"],
+            ["https://example.com:/p"],  # RFC 3986 permits an empty port
+            ["https://192.0.2.1/p"],  # IPv4 host
+            ["https://[2001:db8::1]:443/p"],  # IPv6 literal host
+            # Valid - non-network schemes (any syntactically valid scheme is accepted)
+            ["ftp://files.example.org/pub/file.txt"],
+            ["s3://bucket/key/part-00001.parquet"],
+            ["mailto:user@example.com"],
+            ["urn:isbn:0451450523"],
+            ["file:///var/log/app.log"],  # empty host is permitted by RFC 3986
+            ["custom-scheme+v2://host/p"],  # scheme may contain '+', '-', '.'
+            ["foo:/"],  # path-absolute with an empty segment: scheme + bare '/' (RFC 3986 hier-part)
+            # Valid - percent-encoding and sub-delims
+            ["https://example.com/a%20b"],
+            ["https://example.com/a,b;c=d"],
+            ["https://example.com/p?a=1+2"],
+            # Valid but NOT safe - syntax-only validation, see the docstring caveat
+            ["javascript:alert(1)"],
+            ["data:text/plain,hello"],
+            [None],  # Null - passes (no violation reported)
+            # Invalid - missing or malformed scheme
+            ["example.com"],  # no scheme
+            ["example.com/path"],
+            ["/relative/path"],
+            ["//example.com/p"],  # network-path reference, not an absolute URI
+            ["://example.com"],  # empty scheme
+            ["1https://example.com"],  # scheme must start with a letter
+            ["ht tp://example.com"],  # space in scheme
+            [""],  # empty string
+            # Invalid - whitespace and control characters
+            ["https://exa mple.com"],
+            ["https://example.com/a b"],
+            ["http://example.com\n"],  # trailing newline must be rejected (see issue #1440)
+            ["https://example.com\t/p"],
+            # Invalid - characters that must be percent-encoded
+            ["https://example.com/a<b"],
+            ['https://example.com/a"b'],
+            ["https://example.com/a|b"],
+            ["https://example.com/a\\b"],  # backslash is not a valid path character
+            ["https://example.com/p?q=1#a#b"],  # '#' may not repeat in a fragment
+            # Valid - lowercase hex in percent-encoding is accepted (contrast with the cases above)
+            ["https://example.com/a%2b"],
+        ],
+        schema_url,
+    )
+
+    actual = test_df.select(is_valid_url("a"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' does not match pattern 'URL'"
+
+    checked_schema = "a_does_not_match_pattern_url: string"
+    checked_data = [
+        # Valid (no violation reported)
+        [None],  # https://example.com
+        [None],  # http://example.com/
+        [None],  # https://example.com/path/to/page
+        [None],  # https://example.com/path?query=1&other=2
+        [None],  # https://example.com/path?query=1#fragment
+        [None],  # https://example.com#fragment
+        [None],  # https://sub.domain.example.co.uk/a/b/c
+        [None],  # HTTPS://EXAMPLE.COM
+        [None],  # https://user@example.com/p
+        [None],  # https://user:pw@example.com:8080/p
+        [None],  # https://example.com:8080
+        [None],  # https://example.com:/p
+        [None],  # https://192.0.2.1/p
+        [None],  # https://[2001:db8::1]:443/p
+        [None],  # ftp://files.example.org/pub/file.txt
+        [None],  # s3://bucket/key/part-00001.parquet
+        [None],  # mailto:user@example.com
+        [None],  # urn:isbn:0451450523
+        [None],  # file:///var/log/app.log
+        [None],  # custom-scheme+v2://host/p
+        [None],  # foo:/ - path-absolute with an empty segment
+        [None],  # https://example.com/a%20b
+        [None],  # https://example.com/a,b;c=d
+        [None],  # https://example.com/p?a=1+2
+        [None],  # javascript:alert(1) - syntactically valid
+        [None],  # data:text/plain,hello - syntactically valid
+        [None],  # Null
+        # Invalid - missing or malformed scheme
+        [violation("example.com")],
+        [violation("example.com/path")],
+        [violation("/relative/path")],
+        [violation("//example.com/p")],
+        [violation("://example.com")],
+        [violation("1https://example.com")],
+        [violation("ht tp://example.com")],
+        [violation("")],
+        # Invalid - whitespace and control characters
+        [violation("https://exa mple.com")],
+        [violation("https://example.com/a b")],
+        [violation("http://example.com\n")],
+        [violation("https://example.com\t/p")],
+        # Invalid - characters that must be percent-encoded
+        [violation("https://example.com/a<b")],
+        [violation('https://example.com/a"b')],
+        [violation("https://example.com/a|b")],
+        [violation("https://example.com/a\\b")],
+        [violation("https://example.com/p?q=1#a#b")],
+        # Valid
+        [None],  # https://example.com/a%2b
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_uuid(spark):
+    schema_uuid = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            # Valid - canonical 8-4-4-4-12 hex shape, any case
+            ["550e8400-e29b-41d4-a716-446655440000"],
+            ["550E8400-E29B-41D4-A716-446655440000"],  # uppercase
+            ["550e8400-E29B-41d4-A716-446655440000"],  # mixed case
+            ["6ba7b810-9dad-11d1-80b4-00c04fd430c8"],
+            # Valid by default - version/variant not enforced (accepted like every UUID library)
+            ["12345678-1234-0234-8234-123456789abc"],  # version nibble 0
+            ["12345678-1234-9234-8234-123456789abc"],  # version nibble 9
+            ["12345678-1234-4234-c234-123456789abc"],  # variant nibble c (legacy GUID)
+            ["00000000-0000-0000-0000-000000000000"],  # Nil UUID
+            ["ffffffff-ffff-ffff-ffff-ffffffffffff"],  # Max UUID
+            [None],  # Null - passes (no violation reported)
+            # Invalid - structural
+            ["550e8400e29b41d4a716446655440000"],  # missing hyphens
+            ["550e8400-e29b-41d4-a716-44665544000"],  # last group too short
+            ["{550e8400-e29b-41d4-a716-446655440000}"],  # wrapped in braces
+            ["urn:uuid:550e8400-e29b-41d4-a716-446655440000"],  # URN prefix
+            ["550e8400-e29b-41d4-a716-44665544000g"],  # non-hex character
+            [""],  # empty string
+        ],
+        schema_uuid,
+    )
+
+    actual = test_df.select(is_valid_uuid("a"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' does not match pattern 'UUID'"
+
+    checked_schema = "a_does_not_match_pattern_uuid: string"
+    checked_data = [
+        # Valid (no violation reported)
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        # Invalid - structural
+        [violation("550e8400e29b41d4a716446655440000")],
+        [violation("550e8400-e29b-41d4-a716-44665544000")],
+        [violation("{550e8400-e29b-41d4-a716-446655440000}")],
+        [violation("urn:uuid:550e8400-e29b-41d4-a716-446655440000")],
+        [violation("550e8400-e29b-41d4-a716-44665544000g")],
+        [violation("")],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_uuid_strict(spark):
+    schema_uuid = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            # Valid - versions 1-8, variants 8/9/a/b, any case
+            ["550e8400-e29b-41d4-a716-446655440000"],  # version 4, variant a
+            ["550E8400-E29B-41D4-A716-446655440000"],  # uppercase
+            ["6ba7b810-9dad-11d1-80b4-00c04fd430c8"],  # version 1, variant 8
+            ["12345678-1234-8234-9234-123456789abc"],  # version 8, variant 9
+            ["12345678-1234-3234-b234-123456789abc"],  # version 3, variant b
+            [None],  # Null - passes (no violation reported)
+            # Invalid - version nibble out of range (must be 1-8)
+            ["12345678-1234-0234-8234-123456789abc"],
+            ["12345678-1234-9234-8234-123456789abc"],
+            # Invalid - variant bits out of range (must be 8/9/a/b)
+            ["12345678-1234-4234-0234-123456789abc"],
+            ["12345678-1234-4234-c234-123456789abc"],
+            # Invalid - Nil and Max UUIDs (no valid version/variant)
+            ["00000000-0000-0000-0000-000000000000"],
+            ["ffffffff-ffff-ffff-ffff-ffffffffffff"],
+            # Invalid - structural
+            ["550e8400e29b41d4a716446655440000"],
+        ],
+        schema_uuid,
+    )
+
+    actual = test_df.select(is_valid_uuid("a", strict=True))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' does not match pattern 'UUID_STRICT'"
+
+    checked_schema = "a_does_not_match_pattern_uuid_strict: string"
+    checked_data = [
+        # Valid (no violation reported)
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        [None],
+        # Invalid - version out of range
+        [violation("12345678-1234-0234-8234-123456789abc")],
+        [violation("12345678-1234-9234-8234-123456789abc")],
+        # Invalid - variant out of range
+        [violation("12345678-1234-4234-0234-123456789abc")],
+        [violation("12345678-1234-4234-c234-123456789abc")],
+        # Invalid - Nil and Max UUIDs
+        [violation("00000000-0000-0000-0000-000000000000")],
+        [violation("ffffffff-ffff-ffff-ffff-ffffffffffff")],
+        # Invalid - structural
+        [violation("550e8400e29b41d4a716446655440000")],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "country, pattern_name, cases",
+    [
+        pytest.param(
+            "US",
+            "SSN_US",
+            [
+                # Valid - separators must be consistent (all '-', all ' ', or none)
+                ("123-45-6789", False),
+                ("123456789", False),
+                ("123 45 6789", False),
+                ("899-45-6789", False),  # area boundary just below 900
+                ("667-45-6789", False),  # area just above 666
+                ("001-01-0001", False),  # minimal valid area / group / serial
+                # Invalid - excluded number ranges
+                ("000-45-6789", True),  # area 000
+                ("666-45-6789", True),  # area 666
+                ("900-45-6789", True),  # area 9xx (ITIN range, rejected)
+                ("123-00-6789", True),  # group 00
+                ("123-45-0000", True),  # serial 0000
+                # Invalid - separator / structure
+                ("123-45 6789", True),  # mixed separators
+                ("12-45-6789", True),  # area too short
+                ("1234-45-6789", True),  # area too long
+                ("abc-de-fghi", True),  # non-numeric
+                ("", True),
+                (None, False),
+            ],
+            id="us-ssn",
+        ),
+        pytest.param(
+            "GB",
+            "NINO_GB",
+            [
+                ("AB123456A", False),
+                ("AB 12 34 56 A", False),
+                ("BX586745C", False),
+                ("DF123456A", True),  # invalid first letter
+                ("BG123456A", True),  # unallocated prefix
+                ("AB123456E", True),  # invalid suffix
+                ("", True),
+                ("AB123456A\n", True),
+                (" AB123456A", True),
+                ("AB123456A ", True),
+                (None, False),
+            ],
+            id="gb-nino",
+        ),
+        pytest.param(
+            "IN",
+            "PAN_IN",
+            [
+                ("ABCPD1234F", False),
+                ("AACTA1234A", False),
+                ("ABCZD1234F", True),  # Z is not a valid holder type
+                ("AB12E1234F", True),  # letters and digits in the wrong positions
+                ("ABCPD12345", True),  # final character must be a letter
+                ("", True),
+                ("ABCPD1234F\n", True),
+                (" ABCPD1234F", True),
+                ("ABCPD1234F ", True),
+                (None, False),
+            ],
+            id="in-pan",
+        ),
+    ],
+)
+def test_col_is_valid_national_id(spark, country, pattern_name, cases):
+    test_df = spark.createDataFrame([[value] for value, _ in cases], "a: string")
+    actual = test_df.select(is_valid_national_id("a", country=country))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' does not match pattern '{pattern_name}'"
+
+    expected = spark.createDataFrame(
+        [[violation(value) if is_invalid else None] for value, is_invalid in cases],
+        f"a_does_not_match_pattern_{pattern_name.lower()}: string",
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_national_id_column_expr_and_lowercase_country(spark):
+    schema_ssn = "a: string"
+    test_df = spark.createDataFrame([["123-45-6789"], ["000-45-6789"]], schema_ssn)
+
+    # Column-expression input + case-insensitive country normalization end-to-end
+    actual = test_df.select(is_valid_national_id(F.col("a"), country="us"))
+
+    checked_schema = "a_does_not_match_pattern_ssn_us: string"
+    expected = spark.createDataFrame(
+        [[None], ["Value '000-45-6789' in Column 'a' does not match pattern 'SSN_US'"]],
+        checked_schema,
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
+# The six Java-regex line terminators. Under Java regex (Spark rlike) $ matches just before any one of
+# these at the end of input, so ^...$ leaks a value ending in one; \A...\z (this fix) anchors on the
+# absolute end and rejects all of them. Verified on Spark 4.0.0: $ leaked exactly these six and nothing
+# else (VT/FF/other controls were already rejected), so this is the complete regression set. See #1440.
+_TRAILING_LINE_TERMINATORS = [
+    "\n",  # LF
+    "\r",  # CR
+    "\r\n",  # CRLF
+    "\u0085",  # NEL (next line)
+    "\u2028",  # LS (line separator)
+    "\u2029",  # PS (paragraph separator)
+]
+
+
+# Regression for issue #1440: the DQPattern family is anchored with \A...\z, not ^...$. Each case is a
+# valid value plus that value with a trailing line terminator, which must now be reported as a violation.
+@pytest.mark.parametrize(
+    "check, base_value, pattern_name, result_column",
+    [
+        (is_valid_ipv4_address("a"), "192.168.1.1", "IPV4_ADDRESS", "a_does_not_match_pattern_ipv4_address"),
+        (is_valid_email("a"), "user@example.com", "EMAIL_ADDRESS", "a_does_not_match_pattern_email_address"),
+        (is_valid_uuid("a"), "550e8400-e29b-41d4-a716-446655440000", "UUID", "a_does_not_match_pattern_uuid"),
+        (
+            is_valid_uuid("a", strict=True),
+            "550e8400-e29b-41d4-a716-446655440000",
+            "UUID_STRICT",
+            "a_does_not_match_pattern_uuid_strict",
+        ),
+        (is_valid_national_id("a", country="US"), "123-45-6789", "SSN_US", "a_does_not_match_pattern_ssn_us"),
+    ],
+)
+@pytest.mark.parametrize("terminator", _TRAILING_LINE_TERMINATORS)
+def test_pattern_checks_reject_a_trailing_line_terminator(
+    spark, terminator, check, base_value, pattern_name, result_column
+):
+    terminated_value = base_value + terminator
+    test_df = spark.createDataFrame([[base_value], [terminated_value]], "a: string")
+
+    actual = test_df.select(check)
+
+    expected = spark.createDataFrame(
+        [
+            [None],  # base value stays valid
+            [f"Value '{terminated_value}' in Column 'a' does not match pattern '{pattern_name}'"],
+        ],
+        f"{result_column}: string",
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_country_code_alpha_2(spark):
+    schema = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            # Valid alpha-2 codes
+            ["US"],
+            ["GB"],
+            ["DE"],
+            ["FR"],
+            # Invalid
+            ["USA"],  # alpha-3 code, not alpha-2
+            ["us"],  # lowercase, membership is case-sensitive
+            ["ZZ"],  # not an assigned code
+            [""],  # empty string
+            [None],  # Null - passes (no violation reported)
+        ],
+        schema,
+    )
+
+    actual = test_df.select(is_valid_country_code("a"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 3166-1 country code"
+
+    checked_schema = "a_is_not_a_valid_country_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [None],
+        [violation("USA")],
+        [violation("us")],
+        [violation("ZZ")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_country_code_alpha_3(spark):
+    schema = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["USA"],
+            ["GBR"],
+            ["DEU"],
+            ["US"],  # alpha-2 code, not alpha-3
+            ["usa"],  # lowercase
+            ["ZZZ"],  # not an assigned code
+            [""],
+            [None],
+        ],
+        schema,
+    )
+
+    # Column-expression input with the alpha-3 representation
+    actual = test_df.select(is_valid_country_code(F.col("a"), code_format="alpha-3"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 3166-1 country code"
+
+    checked_schema = "a_is_not_a_valid_country_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("US")],
+        [violation("usa")],
+        [violation("ZZZ")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_country_code_numeric(spark):
+    schema = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["840"],
+            ["826"],
+            ["276"],
+            ["8"],  # too short, codes are zero-padded to three digits
+            ["0840"],  # extra leading zero
+            ["US"],  # alpha-2 code, not numeric
+            [""],
+            [None],
+        ],
+        schema,
+    )
+
+    actual = test_df.select(is_valid_country_code("a", code_format="numeric"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 3166-1 country code"
+
+    checked_schema = "a_is_not_a_valid_country_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("8")],
+        [violation("0840")],
+        [violation("US")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_country_code_case_insensitive(spark):
+    schema = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["us"],  # lowercase alpha-2 accepted when case_sensitive is False
+            ["Gb"],  # mixed case accepted
+            ["DE"],  # canonical case still accepted
+            ["ZZ"],  # not an assigned code, still invalid
+            [""],
+            [None],
+        ],
+        schema,
+    )
+
+    actual = test_df.select(is_valid_country_code("a", case_sensitive=False))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 3166-1 country code"
+
+    checked_schema = "a_is_not_a_valid_country_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("ZZ")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_country_code_alpha_3_case_insensitive(spark):
+    schema = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["usa"],  # lowercase alpha-3 accepted when case_sensitive is False
+            ["Gbr"],  # mixed case accepted
+            ["DEU"],  # canonical case still accepted
+            ["ZZZ"],  # not an assigned code, still invalid
+            [None],
+        ],
+        schema,
+    )
+
+    actual = test_df.select(is_valid_country_code("a", code_format="alpha-3", case_sensitive=False))
+
+    checked_schema = "a_is_not_a_valid_country_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        ["Value 'ZZZ' in Column 'a' is not a valid ISO 3166-1 country code"],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_country_code_numeric_case_insensitive_is_noop(spark):
+    schema = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["840"],  # valid numeric code
+            ["8"],  # wrong width, still invalid regardless of case_sensitive
+            [None],
+        ],
+        schema,
+    )
+
+    # case_sensitive=False has no effect on numeric codes (they contain only digits)
+    actual = test_df.select(is_valid_country_code("a", code_format="numeric", case_sensitive=False))
+
+    checked_schema = "a_is_not_a_valid_country_code: string"
+    checked_data = [
+        [None],
+        ["Value '8' in Column 'a' is not a valid ISO 3166-1 country code"],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_country_code_numeric_int_column(spark):
+    schema = "a: int"
+    test_df = spark.createDataFrame(
+        [
+            [840],  # valid numeric code, matches as an int without needing zero-padding
+            [4],  # would be code 004 (Afghanistan) but is not zero-padded, so it is correctly invalid
+            [None],
+        ],
+        schema,
+    )
+
+    actual = test_df.select(is_valid_country_code("a", code_format="numeric"))
+
+    checked_schema = "a_is_not_a_valid_country_code: string"
+    checked_data = [
+        [None],
+        ["Value '4' in Column 'a' is not a valid ISO 3166-1 country code"],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_currency_code_alphabetic(spark):
+    schema_ccy = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            # Valid ISO 4217 alphabetic codes (incl. the precious-metal code XAU)
+            ["USD"],
+            ["EUR"],
+            ["JPY"],
+            ["XAU"],
+            # Invalid - wrong length, lowercase (case-sensitive), unknown, or empty
+            ["US"],
+            ["USDD"],
+            ["usd"],
+            ["ABC"],
+            [""],
+            [None],  # Null - passes (no violation reported)
+        ],
+        schema_ccy,
+    )
+
+    actual = test_df.select(is_valid_currency_code("a"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 4217 currency code"
+
+    checked_schema = "a_is_not_a_valid_currency_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [None],
+        [violation("US")],
+        [violation("USDD")],
+        [violation("usd")],
+        [violation("ABC")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_currency_code_numeric(spark):
+    schema_ccy = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            # Valid ISO 4217 numeric codes (USD=840, EUR=978, JPY=392)
+            ["840"],
+            ["978"],
+            ["392"],
+            # Invalid - wrong width, alphabetic value, or empty
+            ["8"],
+            ["0840"],
+            ["USD"],
+            [""],
+            [None],  # Null - passes (no violation reported)
+        ],
+        schema_ccy,
+    )
+
+    # Numeric format + column-expression input end-to-end
+    actual = test_df.select(is_valid_currency_code(F.col("a"), code_format="numeric"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 4217 currency code"
+
+    checked_schema = "a_is_not_a_valid_currency_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("8")],
+        [violation("0840")],
+        [violation("USD")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_currency_code_case_insensitive(spark):
+    schema_ccy = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["usd"],  # lowercase alphabetic accepted when case_sensitive is False
+            ["Eur"],  # mixed case accepted
+            ["JPY"],  # canonical case still accepted
+            ["ABC"],  # not an assigned code, still invalid
+            [""],
+            [None],
+        ],
+        schema_ccy,
+    )
+
+    actual = test_df.select(is_valid_currency_code("a", case_sensitive=False))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 4217 currency code"
+
+    checked_schema = "a_is_not_a_valid_currency_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("ABC")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_currency_code_numeric_case_insensitive_is_noop(spark):
+    schema_ccy = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["840"],  # valid numeric code
+            ["8"],  # wrong width, still invalid regardless of case_sensitive
+            [None],
+        ],
+        schema_ccy,
+    )
+
+    # case_sensitive=False has no effect on numeric codes (they contain only digits)
+    actual = test_df.select(is_valid_currency_code("a", code_format="numeric", case_sensitive=False))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 4217 currency code"
+
+    checked_schema = "a_is_not_a_valid_currency_code: string"
+    checked_data = [
+        [None],
+        [violation("8")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_currency_code_numeric_int_column(spark):
+    schema_ccy = "a: int"
+    test_df = spark.createDataFrame(
+        [
+            [840],  # valid numeric code, matches as an int without needing zero-padding
+            [8],  # would be code 008 (Albania) but is not zero-padded, so it is correctly invalid
+            [None],
+        ],
+        schema_ccy,
+    )
+
+    actual = test_df.select(is_valid_currency_code("a", code_format="numeric"))
+
+    checked_schema = "a_is_not_a_valid_currency_code: string"
+    checked_data = [
+        [None],
+        ["Value '8' in Column 'a' is not a valid ISO 4217 currency code"],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_subdivision_code(spark):
+    schema_sub = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            # Valid ISO 3166-2 codes
+            ["US-CA"],
+            ["GB-ENG"],
+            ["DE-BY"],
+            # Invalid - unassigned pairing, lowercase (case-sensitive), no separator, or empty
+            ["US-ZZ"],
+            ["us-ca"],
+            ["USCA"],
+            [""],
+            [None],  # Null - passes (no violation reported)
+        ],
+        schema_sub,
+    )
+
+    actual = test_df.select(is_valid_subdivision_code("a"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 3166-2 subdivision code"
+
+    checked_schema = "a_is_not_a_valid_subdivision_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("US-ZZ")],
+        [violation("us-ca")],
+        [violation("USCA")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_subdivision_code_case_insensitive(spark):
+    schema_sub = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["us-ca"],  # lowercase accepted when case_sensitive is False
+            ["Gb-Eng"],  # mixed case accepted
+            ["DE-BY"],  # canonical case still accepted
+            ["US-ZZ"],  # not an assigned pairing, still invalid
+            [""],
+            [None],
+        ],
+        schema_sub,
+    )
+
+    actual = test_df.select(is_valid_subdivision_code("a", case_sensitive=False))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 3166-2 subdivision code"
+
+    checked_schema = "a_is_not_a_valid_subdivision_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("US-ZZ")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_subdivision_code_with_country_column(spark):
+    schema_sub = "a: string, country: string"
+    test_df = spark.createDataFrame(
+        [
+            ["US-CA", "US"],  # valid code, matches country
+            ["US-CA", "GB"],  # valid code, but does not belong to the given country
+            ["US-ZZ", "US"],  # invalid code, regardless of country match
+            ["US-CA", None],  # null country - nothing to cross-check, passes
+            [None, "US"],  # null code - passes regardless of country
+            ["US-ZZ", None],  # invalid code with a null country - still flagged, message shows 'null'
+        ],
+        schema_sub,
+    )
+
+    actual = test_df.select(is_valid_subdivision_code("a", country_column="country"))
+
+    def violation(value: str, country: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 3166-2 subdivision code for country '{country}' in Column 'country'"
+
+    checked_schema = "a_is_not_a_valid_subdivision_code: string"
+    checked_data = [
+        [None],
+        [violation("US-CA", "GB")],
+        [violation("US-ZZ", "US")],
+        [None],
+        [None],
+        [violation("US-ZZ", "null")],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_subdivision_code_case_insensitive_with_country_column(spark):
+    schema_sub = "a: string, country: string"
+    test_df = spark.createDataFrame(
+        [
+            ["us-ca", "us"],  # lowercase code and country both accepted, still match
+            ["us-ca", "gb"],  # lowercase code valid, but does not belong to the given country
+        ],
+        schema_sub,
+    )
+
+    actual = test_df.select(is_valid_subdivision_code("a", case_sensitive=False, country_column="country"))
+
+    def violation(value: str, country: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 3166-2 subdivision code for country '{country}' in Column 'country'"
+
+    checked_schema = "a_is_not_a_valid_subdivision_code: string"
+    checked_data = [
+        [None],
+        [violation("us-ca", "gb")],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_language_code_alpha_2(spark):
+    schema_lang = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            # Valid ISO 639-1 alpha-2 codes
+            ["en"],
+            ["fr"],
+            ["de"],
+            # Invalid - alpha-3 code, uppercase (case-sensitive), unassigned, or empty
+            ["eng"],
+            ["EN"],
+            ["xx"],
+            [""],
+            [None],  # Null - passes (no violation reported)
+        ],
+        schema_lang,
+    )
+
+    actual = test_df.select(is_valid_language_code("a"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 639 language code"
+
+    checked_schema = "a_is_not_a_valid_language_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("eng")],
+        [violation("EN")],
+        [violation("xx")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_language_code_alpha_3(spark):
+    schema_lang = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["eng"],
+            ["fra"],
+            ["deu"],
+            ["en"],  # alpha-2 code, not alpha-3
+            ["ger"],  # legacy ISO 639-2 bibliographic code for German, not accepted
+            ["xxx"],  # not an assigned code
+            [""],
+            [None],
+        ],
+        schema_lang,
+    )
+
+    # Column-expression input with the alpha-3 representation
+    actual = test_df.select(is_valid_language_code(F.col("a"), code_format="alpha-3"))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 639 language code"
+
+    checked_schema = "a_is_not_a_valid_language_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("en")],
+        [violation("ger")],
+        [violation("xxx")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_valid_language_code_case_insensitive(spark):
+    schema_lang = "a: string"
+    test_df = spark.createDataFrame(
+        [
+            ["EN"],  # uppercase accepted when case_sensitive is False
+            ["Fr"],  # mixed case accepted
+            ["de"],  # canonical case still accepted
+            ["xx"],  # not an assigned code, still invalid
+            [""],
+            [None],
+        ],
+        schema_lang,
+    )
+
+    actual = test_df.select(is_valid_language_code("a", case_sensitive=False))
+
+    def violation(value: str) -> str:
+        return f"Value '{value}' in Column 'a' is not a valid ISO 639 language code"
+
+    checked_schema = "a_is_not_a_valid_language_code: string"
+    checked_data = [
+        [None],
+        [None],
+        [None],
+        [violation("xx")],
+        [violation("")],
+        [None],
+    ]
+    expected = spark.createDataFrame(checked_data, checked_schema)
+
     assertDataFrameEqual(actual, expected)
 
 
@@ -3279,6 +4613,84 @@ def test_col_is_not_equal_to_with_tolerance(spark, set_utc_timezone):
     assertDataFrameEqual(actual, expected)
 
 
+def test_col_comparison_checks_with_nulls_failing(spark):
+    schema = "a: int"
+    test_df = spark.createDataFrame([[1], [5], [None]], schema)
+
+    actual = test_df.select(
+        is_equal_to("a", 1, allow_nulls=False),
+        is_not_equal_to("a", 5, allow_nulls=False),
+        is_not_less_than("a", 1, allow_nulls=False),
+        is_not_greater_than("a", 1, allow_nulls=False),
+        is_in_range("a", 1, 2, allow_nulls=False),
+        is_not_in_range("a", 4, 6, allow_nulls=False),
+    )
+
+    expected_schema = (
+        "a_is_null_or_not_equal_to_value: string, a_is_null_or_equal_to_value: string, "
+        "a_is_null_or_less_than_limit: string, a_is_null_or_greater_than_limit: string, "
+        "a_is_null_or_not_in_range: string, a_is_null_or_in_range: string"
+    )
+    null_message = "Column 'a' value is null"
+    expected = spark.createDataFrame(
+        [
+            [None, None, None, None, None, None],
+            [
+                "Value '5' in Column 'a' is not equal to value: 1",
+                "Value '5' in Column 'a' is equal to value: 5",
+                None,
+                "Value '5' in Column 'a' is greater than limit: 1",
+                "Value '5' in Column 'a' not in range: [1, 2]",
+                "Value '5' in Column 'a' in range: [4, 6]",
+            ],
+            [null_message] * 6,
+        ],
+        expected_schema,
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_comparison_checks_with_nulls_failing_column_expression(spark):
+    # For a column expression the check operates on the whole expression, so nullness is reported
+    # against the expression (e.g. 'a + b' is null when either operand is null), not the operand.
+    schema = "a: int, b: int"
+    test_df = spark.createDataFrame([[1, 1], [10, 10], [None, 1]], schema)
+
+    actual = test_df.select(
+        is_equal_to("a + b", 2, allow_nulls=False),
+        is_not_equal_to("a + b", 5, allow_nulls=False),
+        is_not_less_than("a + b", 1, allow_nulls=False),
+        is_not_greater_than("a + b", 3, allow_nulls=False),
+        is_in_range("a + b", 1, 3, allow_nulls=False),
+        is_not_in_range("a + b", 5, 7, allow_nulls=False),
+    )
+
+    expected_schema = (
+        "a_b_is_null_or_not_equal_to_value: string, a_b_is_null_or_equal_to_value: string, "
+        "a_b_is_null_or_less_than_limit: string, a_b_is_null_or_greater_than_limit: string, "
+        "a_b_is_null_or_not_in_range: string, a_b_is_null_or_in_range: string"
+    )
+    null_message = "Column 'a + b' value is null"
+    expected = spark.createDataFrame(
+        [
+            [None, None, None, None, None, None],
+            [
+                "Value '20' in Column 'a + b' is not equal to value: 2",
+                None,
+                None,
+                "Value '20' in Column 'a + b' is greater than limit: 3",
+                "Value '20' in Column 'a + b' not in range: [1, 3]",
+                None,
+            ],
+            [null_message] * 6,
+        ],
+        expected_schema,
+    )
+
+    assertDataFrameEqual(actual, expected)
+
+
 def test_col_is_equal_to(spark, set_utc_timezone):
     schema = "a: int, b: int, c: date, d: timestamp, e: decimal(10,2), f: array<int>, g: float"
     test_df = spark.createDataFrame(
@@ -3435,14 +4847,14 @@ def test_is_valid_json(spark):
             ['{"key": "value"}', '{"key": value}'],
             ['{"number": 123}', '{"number": 123}'],
             ['{"array": [1, 2, 3]}', '{"array": [1, 2, 3}'],
-            ['Not a JSON string', 'Also not JSON'],
+            ["Not a JSON string", "Also not JSON"],
             [None, None],
-            ['123', '"a string"'],
-            ['true', 'null'],
-            ['[]', '{}'],
+            ["123", '"a string"'],
+            ["true", "null"],
+            ["[]", "{}"],
             ['{"a": 1,}', '{key: "value"}'],
-            ['[1, 2,', '{"a": "b"'],
-            ["{'a': 'b'}", ''],
+            ["[1, 2,", '{"a": "b"'],
+            ["{'a': 'b'}", ""],
             [' {"a": 1} ', '{"b": 2}\n'],
         ],
         schema,
@@ -3494,8 +4906,8 @@ def test_has_json_keys_require_all_true(spark):
             ['{"array": [1, 2, 3]}', '{"array": {1, 2, 3}]'],
             ['{"key": "value"}', '{"missing_key": "value"}'],
             [None, None],
-            ['Not a JSON string', '{"key": "value"}'],
-            ['{"key": "value"}', 'Not a JSON string'],
+            ["Not a JSON string", '{"key": "value"}'],
+            ['{"key": "value"}', "Not a JSON string"],
             ['{"key": "value"}', None],
             [None, '{"key": "value"}'],
             ['{"nested": {"inner_key": "inner_value"}}', '{"nested": {"inner_key": "inner_value"}}'],
@@ -3535,8 +4947,8 @@ def test_has_json_keys_require_all_true(spark):
             ["Value '{\"key\": \"value\"}' in Column 'a' is missing keys in the list: [key, another_key]", None],
             [None, None],
             [
-                "Value '{\"nested\": {\"inner_key\": \"inner_value\"}}' in Column 'a' is missing keys in the list: [key, another_key]",
-                "Value '{\"nested\": {\"inner_key\": \"inner_value\"}}' in Column 'b' is missing keys in the list: [key]",
+                'Value \'{"nested": {"inner_key": "inner_value"}}\' in Column \'a\' is missing keys in the list: [key, another_key]',
+                'Value \'{"nested": {"inner_key": "inner_value"}}\' in Column \'b\' is missing keys in the list: [key]',
             ],
             [
                 None,
@@ -3557,9 +4969,9 @@ def test_has_json_keys_require_at_least_one(spark):
             ['{"key": 1, "another_key": 2, "extra_key": 3}', '{"key": 1, "another_key": 2, "extra_key": 3}'],
             ['{"key": 1}', '{"key": 1}'],
             ['{"number": 123}', '{"random_sample": 1523}'],
-            ['{}', '{}'],
+            ["{}", "{}"],
             ['{"key": "value"', '{"key": "value"'],
-            [None, 'Not a JSON string'],
+            [None, "Not a JSON string"],
             [None, None],
             ['{"key": null}', '{"nested": {"key": null}}'],
         ],
@@ -3611,8 +5023,8 @@ def test_has_valid_json_schema(spark):
             ['{"array": [1, 2, 3]}', '{"array": {1, 2, 3}]'],
             ['{"key": "value"}', '{"missing_key": "value"}'],
             [None, None],
-            ['Not a JSON string', '{"key": "value"}'],
-            ['{"key": "value"}', 'Not a JSON string'],
+            ["Not a JSON string", '{"key": "value"}'],
+            ['{"key": "value"}', "Not a JSON string"],
             ['{"key": "value"}', None],
         ],
         schema,
@@ -3624,7 +5036,7 @@ def test_has_valid_json_schema(spark):
         [
             [None, None],
             [
-                "Value '{\"key\": \"value\", \"another_key\": 123}' in Column 'a' does not conform to expected JSON schema: struct<a:bigint,b:bigint>",
+                'Value \'{"key": "value", "another_key": 123}\' in Column \'a\' does not conform to expected JSON schema: struct<a:bigint,b:bigint>',
                 "Value '{\"key\": \"value\"}' in Column 'b' does not conform to expected JSON schema: struct<a:bigint,b:bigint>",
             ],
             [
@@ -3674,7 +5086,7 @@ def test_has_valid_json_schema_with_nested_depth_5(spark):
         ['{"level1": {"level2": {"level3": {"level4": {"level6": "sample"}}}}}'],
         [None],
         ['{"level1": null}'],
-        ['Not a JSON string'],
+        ["Not a JSON string"],
     ]
 
     test_df = spark.createDataFrame(test_data, schema)
@@ -3686,12 +5098,12 @@ def test_has_valid_json_schema_with_nested_depth_5(spark):
             [None],
             [None],
             [
-                "Value '{\"level1\": {\"level2\": {\"level3\": {\"level4\": {\"level5\": null}}}}}' in Column 'json_data' does not conform to expected JSON schema: struct<level1:struct<level2:struct<level3:struct<level4:struct<level5:string>>>>>"
+                'Value \'{"level1": {"level2": {"level3": {"level4": {"level5": null}}}}}\' in Column \'json_data\' does not conform to expected JSON schema: struct<level1:struct<level2:struct<level3:struct<level4:struct<level5:string>>>>>'
             ],
             [None],
             [None],
             [
-                "Value '{\"level1\": {\"level2\": {\"level3\": {\"level4\": {\"level6\": \"sample\"}}}}}' in Column 'json_data' does not conform to expected JSON schema: struct<level1:struct<level2:struct<level3:struct<level4:struct<level5:string>>>>>",
+                'Value \'{"level1": {"level2": {"level3": {"level4": {"level6": "sample"}}}}}\' in Column \'json_data\' does not conform to expected JSON schema: struct<level1:struct<level2:struct<level3:struct<level4:struct<level5:string>>>>>',
             ],
             [None],
             [None],
@@ -3790,10 +5202,10 @@ def test_has_valid_json_schema_with_complex_nested_structure(spark):
             [None],
             [None],
             [
-                "Value '{\"user\": {\"id\": \"invalid\", \"profile\": {\"name\": \"John\", \"age\": 30}}, \"tags\": [\"admin\"]}' in Column 'json_data' does not conform to expected JSON schema: struct<user:struct<id:bigint,profile:struct<name:string,age:bigint>>,tags:array<string>>"
+                'Value \'{"user": {"id": "invalid", "profile": {"name": "John", "age": 30}}, "tags": ["admin"]}\' in Column \'json_data\' does not conform to expected JSON schema: struct<user:struct<id:bigint,profile:struct<name:string,age:bigint>>,tags:array<string>>'
             ],
             [
-                "Value '{\"user\": {\"id\": 1, \"profile\": {\"name\": 123, \"age\": \"thirty\"}}, \"tags\": [\"admin\"]}' in Column 'json_data' does not conform to expected JSON schema: struct<user:struct<id:bigint,profile:struct<name:string,age:bigint>>,tags:array<string>>"
+                'Value \'{"user": {"id": 1, "profile": {"name": 123, "age": "thirty"}}, "tags": ["admin"]}\' in Column \'json_data\' does not conform to expected JSON schema: struct<user:struct<id:bigint,profile:struct<name:string,age:bigint>>,tags:array<string>>'
             ],
             [None],
         ],
@@ -3801,5 +5213,25 @@ def test_has_valid_json_schema_with_complex_nested_structure(spark):
     )
     actual = test_df.select(
         has_valid_json_schema("json_data", json_schema),
+    )
+    assertDataFrameEqual(actual, expected)
+
+
+def test_col_is_in_list_bare_string_resolves_as_column(spark):
+    """Test that a bare string in the allowed list resolves as a column reference, not a literal."""
+    input_schema = "value: string, allowed: string"
+    test_df = spark.createDataFrame(
+        [("foo", "foo"), ("bar", "foo"), ("baz", "baz")],
+        input_schema,
+    )
+    actual = test_df.select(is_in_list("value", ["allowed"]))
+    checked_schema = "value_is_not_in_the_list: string"
+    expected = spark.createDataFrame(
+        [
+            [None],
+            ["Value 'bar' in Column 'value' is not in the allowed list: [foo]"],
+            [None],
+        ],
+        checked_schema,
     )
     assertDataFrameEqual(actual, expected)

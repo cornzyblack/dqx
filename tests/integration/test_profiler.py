@@ -7,6 +7,7 @@ import pyspark.sql.types as T
 from databricks.sdk.errors import NotFound
 
 from databricks.labs.dqx.config import InputConfig, LLMModelConfig
+from databricks.labs.dqx.errors import InvalidConfigError
 from databricks.labs.dqx.profiler.profiler import DQProfiler, DQProfile
 
 from tests.constants import TEST_CATALOG
@@ -70,25 +71,34 @@ def test_profiler(spark, ws):
     )
 
     profiler = DQProfiler(ws)
-    stats, profiles = profiler.profile(inp_df, options={"sample_fraction": None, "llm_primary_key_detection": False})
+    stats, profiles = profiler.profile(
+        inp_df, options={"sample_fraction": None, "llm_primary_key_detection": False, "has_no_outliers": True}
+    )
 
     expected_profiles = [
         DQProfile(name="is_not_null", column="t1", description=None, parameters=None),
         DQProfile(
             name="min_max", column="t1", description="Real min/max values were used", parameters={"min": 1, "max": 3}
         ),
-        DQProfile(name='is_not_null', column='d1', description=None, parameters=None),
         DQProfile(
-            name='min_max',
-            column='d1',
-            description='Real min/max values were used',
-            parameters={'max': Decimal('333323.00'), 'min': Decimal('1.23')},
+            name="has_no_outliers",
+            column="t1",
+            description="Column t1 has 0.0% of outliers (allowed: 1.0%). Lower boundary - -1.5, upper boundary - 5.5.",
+            parameters=None,
+            filter=None,
+        ),
+        DQProfile(name="is_not_null", column="d1", description=None, parameters=None),
+        DQProfile(
+            name="min_max",
+            column="d1",
+            description="Real min/max values were used",
+            parameters={"max": Decimal("333323.00"), "min": Decimal("1.23")},
         ),
         DQProfile(
-            name='is_not_empty',
-            column='t2',
+            name="is_not_empty",
+            column="t2",
             description=None,
-            parameters={'trim_strings': True},
+            parameters={"trim_strings": True},
         ),
         DQProfile(name="is_not_null", column="s1.ns1", description=None, parameters=None),
         DQProfile(
@@ -100,7 +110,7 @@ def test_profiler(spark, ws):
                 "max": datetime(2023, 1, 9, 0, 0, tzinfo=timezone.utc),
             },
         ),
-        DQProfile(name="is_not_null_or_empty", column="s1.s2.ns2", description=None, parameters={'trim_strings': True}),
+        DQProfile(name="is_not_null_or_empty", column="s1.s2.ns2", description=None, parameters={"trim_strings": True}),
         DQProfile(name="is_not_null", column="s1.s2.ns3", description=None, parameters=None),
         DQProfile(
             name="min_max",
@@ -130,28 +140,57 @@ def test_profiler_is_in_large_table_few_distinct_values(spark, ws):
     assert set(is_in_profiles[0].parameters["in"]) == {"active", "inactive", "pending"}
 
 
-def test_profiler_timestamp_ntz_column(spark, ws):
-    # Verifies that TimestampNTZType is included in _supports_min_max and produces a min_max profile.
-    schema = T.StructType([T.StructField("created_at", T.TimestampNTZType())])
+@pytest.mark.parametrize(
+    "timestamp_type",
+    [T.TimestampType(), T.TimestampNTZType()],
+    ids=["timestamp", "timestamp_ntz"],
+)
+@pytest.mark.parametrize(
+    ("rounding", "expected_parameters"),
+    [
+        (
+            False,
+            {
+                "min": datetime(2024, 1, 1, 0, 0, 0, 123456, tzinfo=timezone.utc),
+                "max": datetime(2024, 12, 31, 23, 59, 59, 654321, tzinfo=timezone.utc),
+            },
+        ),
+        (
+            True,
+            {
+                "min": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                "max": datetime(2025, 1, 1, tzinfo=timezone.utc),
+            },
+        ),
+    ],
+    ids=["rounding_disabled", "rounding_enabled"],
+)
+def test_profiler_timestamp_precision_and_rounding(
+    spark, ws, set_utc_timezone, timestamp_type, rounding, expected_parameters
+):
+    schema = T.StructType([T.StructField("created_at", timestamp_type)])
     input_df = spark.createDataFrame(
         [
-            [datetime(2024, 1, 1, 0, 0, 0)],
-            [datetime(2024, 6, 15, 12, 0, 0)],
-            [datetime(2024, 12, 31, 23, 59, 59)],
+            [datetime(2024, 1, 1, 0, 0, 0, 123456)],
+            # An interior value between the min and max, so the assertion checks min/max actually
+            # select the extremes rather than just echoing a two-row dataset.
+            [datetime(2024, 6, 15, 12, 30, 30, 500000)],
+            [datetime(2024, 12, 31, 23, 59, 59, 654321)],
         ],
         schema=schema,
     )
 
     profiler = DQProfiler(ws)
-    _, profiles = profiler.profile(input_df, options={"sample_fraction": None, "llm_primary_key_detection": False})
+    _, profiles = profiler.profile(
+        input_df, options={"sample_fraction": None, "llm_primary_key_detection": False, "round": rounding}
+    )
 
     min_max_profiles = [p for p in profiles if p.name == "min_max" and p.column == "created_at"]
     assert len(min_max_profiles) == 1
-    assert min_max_profiles[0].parameters["min"] is not None
-    assert min_max_profiles[0].parameters["max"] is not None
+    assert min_max_profiles[0].parameters == expected_parameters
 
 
-def test_profiler_rounding_midnight_behavior(spark, ws):
+def test_profiler_rounding_midnight_behavior(spark, ws, set_utc_timezone):
     inp_schema = T.StructType(
         [
             T.StructField("t1", T.IntegerType()),
@@ -209,22 +248,31 @@ def test_profiler_rounding_midnight_behavior(spark, ws):
     )
 
     profiler = DQProfiler(ws)
-    stats, profiles = profiler.profile(inp_df, options={"sample_fraction": None, "llm_primary_key_detection": False})
+    stats, profiles = profiler.profile(
+        inp_df, options={"sample_fraction": None, "llm_primary_key_detection": False, "has_no_outliers": True}
+    )
 
     expected_profiles = [
         DQProfile(name="is_not_null", column="t1", description=None, parameters=None),
         DQProfile(
             name="min_max", column="t1", description="Real min/max values were used", parameters={"min": 1, "max": 3}
         ),
-        DQProfile(name='is_not_null', column='d1', description=None, parameters=None),
         DQProfile(
-            name='min_max',
-            column='d1',
-            description='Real min/max values were used',
-            parameters={'max': Decimal('333323.00'), 'min': Decimal('1.23')},
+            name="has_no_outliers",
+            column="t1",
+            description="Column t1 has 0.0% of outliers (allowed: 1.0%). Lower boundary - -1.5, upper boundary - 5.5.",
+            parameters=None,
+            filter=None,
+        ),
+        DQProfile(name="is_not_null", column="d1", description=None, parameters=None),
+        DQProfile(
+            name="min_max",
+            column="d1",
+            description="Real min/max values were used",
+            parameters={"max": Decimal("333323.00"), "min": Decimal("1.23")},
         ),
         DQProfile(
-            name='is_not_empty', column='t2', description=None, parameters={'trim_strings': True}
+            name="is_not_empty", column="t2", description=None, parameters={"trim_strings": True}
         ),  # t2 contains null values
         DQProfile(name="is_not_null", column="s1.ns1", description=None, parameters=None),
         DQProfile(
@@ -237,7 +285,7 @@ def test_profiler_rounding_midnight_behavior(spark, ws):
             },
         ),
         DQProfile(
-            name="is_not_null_or_empty", column="s1.s2.ns2", description=None, parameters={'trim_strings': True}
+            name="is_not_null_or_empty", column="s1.s2.ns2", description=None, parameters={"trim_strings": True}
         ),  # s1.s2.ns2 contains non-null and non-empty values
         DQProfile(name="is_not_null", column="s1.s2.ns3", description=None, parameters=None),
         DQProfile(
@@ -325,6 +373,7 @@ def test_profiler_non_default_profile_options(spark, ws):
         "limit": 1000,  # limit the number of samples
         "filter": "t1 > 0",  # filter out the first row
         "llm_primary_key_detection": False,  # disable pk detection
+        "has_no_outliers": True,  # generate has_no_outliers profile
     }
 
     stats, profiles = profiler.profile(input_df, columns=input_df.columns, options=profile_options)
@@ -339,10 +388,17 @@ def test_profiler_non_default_profile_options(spark, ws):
             filter="t1 > 0",
         ),
         DQProfile(
-            name='is_not_empty',  # Column t2 contains null values
-            column='t2',
+            name="has_no_outliers",
+            column="t1",
+            description="Column t1 has 0.0% of outliers (allowed: 1.0%). Lower boundary - -1.5, upper boundary - 5.5.",
+            parameters=None,
+            filter="t1 > 0",
+        ),
+        DQProfile(
+            name="is_not_empty",  # Column t2 contains null values
+            column="t2",
             description=None,
-            parameters={'trim_strings': False},
+            parameters={"trim_strings": False},
             filter="t1 > 0",
         ),
         DQProfile(name="is_not_null", column="s1.ns1", description=None, parameters=None, filter="t1 > 0"),
@@ -351,8 +407,8 @@ def test_profiler_non_default_profile_options(spark, ws):
             column="s1.ns1",
             description="Real min/max values were used",
             parameters={
-                'max': datetime(2023, 1, 8, 10, 0, 11, tzinfo=timezone.utc),
-                'min': datetime(2023, 1, 6, 10, 0, 11, tzinfo=timezone.utc),
+                "max": datetime(2023, 1, 8, 10, 0, 11, tzinfo=timezone.utc),
+                "min": datetime(2023, 1, 6, 10, 0, 11, tzinfo=timezone.utc),
             },
             filter="t1 > 0",
         ),
@@ -360,7 +416,7 @@ def test_profiler_non_default_profile_options(spark, ws):
             name="is_not_null_or_empty",
             column="s1.s2.ns2",
             description=None,
-            parameters={'trim_strings': False},
+            parameters={"trim_strings": False},
             filter="t1 > 0",
         ),
         DQProfile(name="is_not_null", column="s1.s2.ns3", description=None, parameters=None, filter="t1 > 0"),
@@ -440,6 +496,7 @@ def test_profiler_non_default_profile_options_remove_outliers_no_outlier_columns
         "sample_seed": None,  # seed for sampling
         "limit": 1000,  # limit the number of samples
         "llm_primary_key_detection": False,  # disable pk detection
+        "has_no_outliers": True,  # generate has_no_outliers profile
     }
 
     stats, profiles = profiler.profile(inp_df, columns=inp_df.columns, options=profile_options)
@@ -450,17 +507,26 @@ def test_profiler_non_default_profile_options_remove_outliers_no_outlier_columns
             name="min_max", column="t1", description="Real min/max values were used", parameters={"min": 1, "max": 3}
         ),
         DQProfile(
-            name='is_not_empty', column='t2', description=None, parameters={'trim_strings': False}
+            name="has_no_outliers",
+            column="t1",
+            description="Column t1 has 0.0% of outliers (allowed: 1.0%). Lower boundary - -1.5, upper boundary - 5.5.",
+            parameters=None,
+            filter=None,
+        ),
+        DQProfile(
+            name="is_not_empty", column="t2", description=None, parameters={"trim_strings": False}
         ),  # t2 contains null values
         DQProfile(name="is_not_null", column="s1.ns1", description=None, parameters=None),
         DQProfile(
             name="min_max",
             column="s1.ns1",
             # 9999-12-31 is an outlier; with num_sigmas=1 max is capped at avg+1σ (real min kept).
-            description="Real min value was used. Max was capped by 1 sigmas. avg=85582778411.0, stddev=145335926001.69772, max=253402250411",
+            # Timestamps now flow through a double epoch (sub-second precision preserved), so the
+            # aggregates read as floats (max=...411.0) and the capped max carries fractional seconds.
+            description="Real min value was used. Max was capped by 1 sigmas. avg=85582778411.0, stddev=145335926001.69772, max=253402250411.0",
             parameters={
-                'min': datetime(2023, 1, 6, 10, 0, 11, tzinfo=timezone.utc),
-                'max': datetime(9287, 7, 10, 4, 33, 32, tzinfo=timezone.utc),
+                "min": datetime(2023, 1, 6, 10, 0, 11, tzinfo=timezone.utc),
+                "max": datetime(9287, 7, 10, 4, 33, 32, 697723, tzinfo=timezone.utc),
             },
         ),
         DQProfile(
@@ -543,6 +609,7 @@ def test_profiler_non_default_profile_options_with_rounding_enabled(spark, ws):
         "sample_seed": None,  # seed for sampling
         "limit": 1000,  # limit the number of samples
         "llm_primary_key_detection": False,  # disable pk detection
+        "has_no_outliers": True,  # generate has_no_outliers profile
     }
 
     stats, profiles = profiler.profile(inp_df, columns=inp_df.columns, options=profile_options)
@@ -552,13 +619,20 @@ def test_profiler_non_default_profile_options_with_rounding_enabled(spark, ws):
         DQProfile(
             name="min_max", column="t1", description="Real min/max values were used", parameters={"min": 1, "max": 3}
         ),
-        DQProfile(name='is_not_empty', column='t2', description=None, parameters={'trim_strings': False}),
+        DQProfile(
+            name="has_no_outliers",
+            column="t1",
+            description="Column t1 has 0.0% of outliers (allowed: 1.0%). Lower boundary - -1.5, upper boundary - 5.5.",
+            parameters=None,
+            filter=None,
+        ),
+        DQProfile(name="is_not_empty", column="t2", description=None, parameters={"trim_strings": False}),
         DQProfile(name="is_not_null", column="s1.ns1", description=None, parameters=None),
         DQProfile(
             name="min_max",
             column="s1.ns1",
             description="Real min/max values were used",
-            parameters={'max': datetime.max, 'min': datetime(2023, 1, 6).replace(tzinfo=timezone.utc)},
+            parameters={"max": datetime.max, "min": datetime(2023, 1, 6).replace(tzinfo=timezone.utc)},
         ),
         DQProfile(
             name="is_not_null_or_empty", column="s1.s2.ns2", description=None, parameters={"trim_strings": False}
@@ -593,20 +667,20 @@ def test_profiler_when_numeric_field_is_empty(spark, ws):
     stats, profiles = profiler.profile(input_df, options={"sample_fraction": None, "llm_primary_key_detection": False})
 
     expected_profiles = [
-        DQProfile(name='is_not_null', column='col1', description=None, parameters=None),
+        DQProfile(name="is_not_null", column="col1", description=None, parameters=None),
         DQProfile(
-            name='min_max', column='col1', description='Real min/max values were used', parameters={'max': 2, 'min': 1}
+            name="min_max", column="col1", description="Real min/max values were used", parameters={"max": 2, "min": 1}
         ),
         DQProfile(
-            name='min_max', column='col2', description='Real min/max values were used', parameters={'max': 3, 'min': 2}
+            name="min_max", column="col2", description="Real min/max values were used", parameters={"max": 3, "min": 2}
         ),
-        DQProfile(name='is_not_null', column='col3', description=None, parameters=None),
+        DQProfile(name="is_not_null", column="col3", description=None, parameters=None),
         DQProfile(
-            name='min_max', column='col3', description='Real min/max values were used', parameters={'max': 4, 'min': 3}
+            name="min_max", column="col3", description="Real min/max values were used", parameters={"max": 4, "min": 3}
         ),
-        DQProfile(name='is_not_null', column='col4', description=None, parameters=None),
+        DQProfile(name="is_not_null", column="col4", description=None, parameters=None),
         DQProfile(
-            name='min_max', column='col4', description='Real min/max values were used', parameters={'max': 4, 'min': 1}
+            name="min_max", column="col4", description="Real min/max values were used", parameters={"max": 4, "min": 1}
         ),
     ]
 
@@ -657,10 +731,144 @@ def test_profiler_sampling(spark, ws):
     assert profiles == profiles2
 
 
+def test_profiler_sample_by_column_with_uniform_fraction(spark, ws):
+    schema = "region: string, value: int"
+    rows = [["us", value] for value in range(20)] + [["eu", value] for value in range(20)]
+    input_df = spark.createDataFrame(rows, schema)
+
+    profiler = DQProfiler(ws)
+    profiler_opts = {
+        "sample_by_column": "region",
+        "sample_fraction": 0.5,
+        "sample_seed": 7,
+        "limit": None,
+        "llm_primary_key_detection": False,
+    }
+    stats, profiles = profiler.profile(input_df, options=profiler_opts)
+    stats2, profiles2 = profiler.profile(input_df, options=profiler_opts)
+
+    assert "region" in stats
+    assert "value" in stats
+    assert profiles == profiles2
+    assert _round_stats(stats) == _round_stats(stats2)
+
+
+def test_profiler_sample_by_column_with_explicit_fractions(spark, ws):
+    schema = "region: string, value: int"
+    rows = [["us", value] for value in range(50)] + [["eu", value] for value in range(50)]
+    input_df = spark.createDataFrame(rows, schema)
+
+    profiler = DQProfiler(ws)
+    profiler_opts = {
+        "sample_by_column": "region",
+        "sample_fraction": {"us": 1.0, "eu": 0.0},
+        "sample_seed": 7,
+        "limit": None,
+        "llm_primary_key_detection": False,
+    }
+    stats, _ = profiler.profile(input_df, options=profiler_opts)
+
+    assert stats["region"]["count"] == 50
+    assert stats["region"]["count_distinct"] == 1
+
+
+def test_profiler_dict_sample_fraction_without_sample_by_column_raises(spark, ws):
+    input_df = spark.createDataFrame([["us", 1]], "region: string, value: int")
+
+    profiler = DQProfiler(ws)
+    with pytest.raises(
+        InvalidConfigError,
+        match="sample_fraction must be of type float when sample_by_column is not set",
+    ):
+        profiler.profile(
+            input_df,
+            options={
+                "sample_fraction": {"us": 1.0},
+                "sample_by_column": None,
+                "llm_primary_key_detection": False,
+            },
+        )
+
+
+def test_profiler_sample_by_column_missing_column_raises(spark, ws):
+    input_df = spark.createDataFrame([["us", 1]], "region: string, value: int")
+
+    profiler = DQProfiler(ws)
+    with pytest.raises(InvalidConfigError, match="sample_by_column 'missing' is not a column"):
+        profiler.profile(
+            input_df,
+            options={
+                "sample_by_column": "missing",
+                "sample_fraction": 0.5,
+                "llm_primary_key_detection": False,
+            },
+        )
+
+
+def test_profiler_sample_by_column_requires_fractions(spark, ws):
+    input_df = spark.createDataFrame([["us", 1]], "region: string, value: int")
+
+    profiler = DQProfiler(ws)
+    with pytest.raises(
+        InvalidConfigError,
+        match="sample_fraction must be provided when sample_by_column is set",
+    ):
+        profiler.profile(
+            input_df,
+            options={
+                "sample_by_column": "region",
+                "sample_fraction": None,
+                "llm_primary_key_detection": False,
+            },
+        )
+
+
+def test_profiler_sample_by_values_limit_bounds_high_cardinality(spark, ws):
+    schema = "id: string, value: int"
+    rows = [[f"id_{i}", i] for i in range(200)]
+    input_df = spark.createDataFrame(rows, schema)
+
+    profiler = DQProfiler(ws)
+    stats, _ = profiler.profile(
+        input_df,
+        options={
+            "sample_by_column": "id",
+            "sample_fraction": 1.0,
+            "sample_by_values_limit": 10,
+            "sample_seed": 7,
+            "limit": None,
+            "llm_primary_key_detection": False,
+        },
+    )
+
+    assert stats["id"]["count_distinct"] == 10
+
+
+def test_profiler_sample_by_values_limit_above_cardinality_keeps_all_strata(spark, ws):
+    schema = "id: string, value: int"
+    rows = [[f"id_{i}", i] for i in range(200)]
+    input_df = spark.createDataFrame(rows, schema)
+
+    profiler = DQProfiler(ws)
+    stats, _ = profiler.profile(
+        input_df,
+        options={
+            "sample_by_column": "id",
+            "sample_fraction": 1.0,
+            "sample_by_values_limit": 1000,
+            "sample_seed": 7,
+            "limit": None,
+            "llm_primary_key_detection": False,
+        },
+    )
+
+    assert stats["id"]["count_distinct"] == 200
+
+
 def test_profile_table(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema = T.StructType(
         [
@@ -718,7 +926,7 @@ def test_profile_table(spark, ws, make_schema, make_random):
 def test_profile_table_non_default_opts(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema = "category: string, value: int"
     input_df = spark.createDataFrame(
@@ -772,7 +980,7 @@ def test_profile_table_non_default_opts(spark, ws, make_schema, make_random):
 def test_profile_table_with_column_selection(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema = "col1: int, col2: string, col3: double, col4: boolean"
     input_df = spark.createDataFrame(
@@ -817,8 +1025,8 @@ def test_profile_table_with_column_selection(spark, ws, make_schema, make_random
 def test_profile_tables_for_patterns(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table1_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
-    table2_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table1_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
+    table2_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema1 = "col1: int, col2: int, col3: int, col4 int"
     input_df1 = spark.createDataFrame([[1, 3, 3, 1], [2, None, 4, 1], [1, 2, 3, 4]], input_schema1)
@@ -836,32 +1044,32 @@ def test_profile_tables_for_patterns(spark, ws, make_schema, make_random):
     profiles = profiler.profile_tables_for_patterns(patterns=[table1_name, table2_name], options=options)
     expected_profiles = {
         table1_name: [
-            DQProfile(name='is_not_null', column='col1', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col1", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col1',
-                description='Real min/max values were used',
-                parameters={'max': 2, 'min': 1},
+                name="min_max",
+                column="col1",
+                description="Real min/max values were used",
+                parameters={"max": 2, "min": 1},
             ),
             DQProfile(
-                name='min_max',
-                column='col2',
-                description='Real min/max values were used',
-                parameters={'max': 3, 'min': 2},
+                name="min_max",
+                column="col2",
+                description="Real min/max values were used",
+                parameters={"max": 3, "min": 2},
             ),
-            DQProfile(name='is_not_null', column='col3', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col3", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col3',
-                description='Real min/max values were used',
-                parameters={'max': 4, 'min': 3},
+                name="min_max",
+                column="col3",
+                description="Real min/max values were used",
+                parameters={"max": 4, "min": 3},
             ),
-            DQProfile(name='is_not_null', column='col4', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col4", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col4',
-                description='Real min/max values were used',
-                parameters={'max': 4, 'min': 1},
+                name="min_max",
+                column="col4",
+                description="Real min/max values were used",
+                parameters={"max": 4, "min": 1},
             ),
         ],
         table2_name: [
@@ -885,7 +1093,7 @@ def test_profile_tables_for_patterns(spark, ws, make_schema, make_random):
 def test_profile_tables_for_patterns_with_exclude_patterns(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema = "col1: int, col2: int, col3: int, col4 int"
     input_df = spark.createDataFrame([[1, 3, 3, 1], [2, None, 4, 1], [1, 2, 3, 4]], input_schema)
@@ -911,32 +1119,32 @@ def test_profile_tables_for_patterns_with_exclude_patterns(spark, ws, make_schem
 
     expected_profiles = {
         table_name: [
-            DQProfile(name='is_not_null', column='col1', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col1", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col1',
-                description='Real min/max values were used',
-                parameters={'max': 2, 'min': 1},
+                name="min_max",
+                column="col1",
+                description="Real min/max values were used",
+                parameters={"max": 2, "min": 1},
             ),
             DQProfile(
-                name='min_max',
-                column='col2',
-                description='Real min/max values were used',
-                parameters={'max': 3, 'min': 2},
+                name="min_max",
+                column="col2",
+                description="Real min/max values were used",
+                parameters={"max": 3, "min": 2},
             ),
-            DQProfile(name='is_not_null', column='col3', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col3", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col3',
-                description='Real min/max values were used',
-                parameters={'max': 4, 'min': 3},
+                name="min_max",
+                column="col3",
+                description="Real min/max values were used",
+                parameters={"max": 4, "min": 3},
             ),
-            DQProfile(name='is_not_null', column='col4', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col4", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col4',
-                description='Real min/max values were used',
-                parameters={'max': 4, 'min': 1},
+                name="min_max",
+                column="col4",
+                description="Real min/max values were used",
+                parameters={"max": 4, "min": 1},
             ),
         ],
     }
@@ -949,8 +1157,8 @@ def test_profile_tables_include_patterns(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
     known_random = f"_data_{make_random(10).lower()}"
-    table1_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}" + known_random
-    table2_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table1_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}" + known_random
+    table2_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema1 = "col1: int, col2: int, col3: int, col4 int"
     input_df1 = spark.createDataFrame([[1, 3, 3, 1], [2, None, 4, 1], [1, 2, 3, 4]], input_schema1)
@@ -969,32 +1177,32 @@ def test_profile_tables_include_patterns(spark, ws, make_schema, make_random):
     )
     expected_profiles = {
         table1_name: [
-            DQProfile(name='is_not_null', column='col1', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col1", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col1',
-                description='Real min/max values were used',
-                parameters={'max': 2, 'min': 1},
+                name="min_max",
+                column="col1",
+                description="Real min/max values were used",
+                parameters={"max": 2, "min": 1},
             ),
             DQProfile(
-                name='min_max',
-                column='col2',
-                description='Real min/max values were used',
-                parameters={'max': 3, 'min': 2},
+                name="min_max",
+                column="col2",
+                description="Real min/max values were used",
+                parameters={"max": 3, "min": 2},
             ),
-            DQProfile(name='is_not_null', column='col3', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col3", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col3',
-                description='Real min/max values were used',
-                parameters={'max': 4, 'min': 3},
+                name="min_max",
+                column="col3",
+                description="Real min/max values were used",
+                parameters={"max": 4, "min": 3},
             ),
-            DQProfile(name='is_not_null', column='col4', description=None, parameters=None),
+            DQProfile(name="is_not_null", column="col4", description=None, parameters=None),
             DQProfile(
-                name='min_max',
-                column='col4',
-                description='Real min/max values were used',
-                parameters={'max': 4, 'min': 1},
+                name="min_max",
+                column="col4",
+                description="Real min/max values were used",
+                parameters={"max": 4, "min": 1},
             ),
         ],
     }
@@ -1007,7 +1215,7 @@ def test_profile_tables_include_patterns(spark, ws, make_schema, make_random):
 def test_profile_tables_no_pattern_match(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table1_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table1_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema = "col1: int, col2: string"
     input_df = spark.createDataFrame([[1, "test"], [2, "data"]], input_schema)
@@ -1023,8 +1231,8 @@ def test_profile_tables_no_pattern_match(spark, ws, make_schema, make_random):
 def test_profile_tables_for_patterns_with_no_options(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table1_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
-    table2_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table1_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
+    table2_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema1 = "col1: int, col2: int, col3: int, col4 int"
     input_df1 = spark.createDataFrame([[1, 3, 3, 1], [2, None, 4, 1], [1, 2, 3, 4]], input_schema1)
@@ -1049,8 +1257,8 @@ def test_profile_tables_for_patterns_with_no_options(spark, ws, make_schema, mak
 def test_profile_tables_for_patterns_with_no_matched_options(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table1_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
-    table2_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table1_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
+    table2_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema1 = "col1: string, col2: string, col3: string"
     input_df1 = spark.createDataFrame([["1", None, "3"], ["2", None, "4"], ["1", None, "3"]], input_schema1)
@@ -1094,8 +1302,8 @@ def test_profile_tables_for_patterns_with_no_matched_options(spark, ws, make_sch
 def test_profile_tables_for_patterns_with_common_opts(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table1_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
-    table2_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table1_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
+    table2_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema = "category: string, value: int"
     input_df = spark.createDataFrame(
@@ -1177,7 +1385,7 @@ def test_profile_tables_for_patterns_with_common_opts(spark, ws, make_schema, ma
 def test_profile_tables_for_patterns_with_different_opts(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table_prefix = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table_prefix = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
     table1_name = f"{table_prefix}_001"
     table2_name = f"{table_prefix}_002"
 
@@ -1270,8 +1478,8 @@ def test_profile_tables_for_patterns_with_different_opts(spark, ws, make_schema,
 def test_profile_tables_for_patterns_with_partial_opts_match(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table1_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}_001"
-    table2_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}_002"
+    table1_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}_001"
+    table2_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}_002"
 
     input_schema = "category: string, value: int"
     input_df = spark.createDataFrame(
@@ -1353,8 +1561,8 @@ def test_profile_tables_for_patterns_with_partial_opts_match(spark, ws, make_sch
 def test_profile_tables_for_patterns_with_selected_columns(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table1_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}_tbl1"
-    table2_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}_tbl2"
+    table1_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}_tbl1"
+    table2_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}_tbl2"
 
     input_schema1 = "col1: int, col2: string, col3: double, col4: boolean"
     input_df1 = spark.createDataFrame(
@@ -1529,6 +1737,7 @@ def test_profile_with_dataset_filter(spark, ws):
         "limit": None,
         "filter": "machine_id IN ('MCH-002', 'MCH-003') AND maintenance_type = 'preventive'",
         "llm_primary_key_detection": False,
+        "has_no_outliers": True,
     }
 
     profiler = DQProfiler(ws)
@@ -1573,11 +1782,18 @@ def test_profile_with_dataset_filter(spark, ws):
             name="min_max",
             column="cost",
             parameters={
-                "min": Decimal('100.00'),
-                "max": Decimal('300.50'),
+                "min": Decimal("100.00"),
+                "max": Decimal("300.50"),
             },
             filter="machine_id IN ('MCH-002', 'MCH-003') AND maintenance_type = 'preventive'",
             description="Real min/max values were used",
+        ),
+        DQProfile(
+            name="has_no_outliers",
+            column="cost",
+            description="Column cost has 0.0% of outliers (allowed: 1.0%). Lower boundary - -25.0, upper boundary - 325.0.",
+            parameters=None,
+            filter="machine_id IN ('MCH-002', 'MCH-003') AND maintenance_type = 'preventive'",
         ),
         DQProfile(
             name="is_not_null",
@@ -1732,8 +1948,8 @@ def test_profile_with_no_filter(spark, ws):
             name="min_max",
             column="cost",
             parameters={
-                "min": Decimal('-500.00'),
-                "max": Decimal('1200.50'),
+                "min": Decimal("-500.00"),
+                "max": Decimal("1200.50"),
             },
             filter=None,
             description="Real min/max values were used",
@@ -1779,35 +1995,56 @@ def test_profiler_with_pk_detection(spark, ws):
 
     llm_model_config = LLMModelConfig()
     profiler = DQProfiler(ws, llm_model_config=llm_model_config)
-    stats, profiles = profiler.profile(input_df, options={"sample_fraction": None})
+    stats, profiles = profiler.profile(input_df, options={"sample_fraction": None, "has_no_outliers": True})
 
     expected_profiles = [
-        DQProfile(name='is_not_null', column='order_id', description=None, parameters=None),
+        DQProfile(name="is_not_null", column="order_id", description=None, parameters=None),
         DQProfile(
-            name='min_max',
-            column='order_id',
-            description='Real min/max values were used',
-            parameters={'max': 5, 'min': 1},
+            name="min_max",
+            column="order_id",
+            description="Real min/max values were used",
+            parameters={"max": 5, "min": 1},
         ),
-        DQProfile(name='is_not_null', column='customer_id', description=None, parameters=None),
         DQProfile(
-            name='min_max',
-            column='customer_id',
-            description='Real min/max values were used',
-            parameters={'max': 102, 'min': 100},
+            name="has_no_outliers",
+            column="order_id",
+            description="Column order_id has 0.0% of outliers (allowed: 1.0%). Lower boundary - -0.5, upper boundary - 6.5.",
+            parameters=None,
+            filter=None,
         ),
-        DQProfile(name='is_not_null', column='amount', description=None, parameters=None),
+        DQProfile(name="is_not_null", column="customer_id", description=None, parameters=None),
         DQProfile(
-            name='min_max',
-            column='amount',
-            description='Real min/max values were used',
-            parameters={'max': 90, 'min': 45},
+            name="min_max",
+            column="customer_id",
+            description="Real min/max values were used",
+            parameters={"max": 102, "min": 100},
         ),
-        DQProfile(name='is_not_null_or_empty', column='status', description=None, parameters={'trim_strings': True}),
         DQProfile(
-            name='is_unique',
-            column='order_id',
-            description='LLM-detected primary key columns: order_id',
+            name="has_no_outliers",
+            column="customer_id",
+            description="Column customer_id has 0.0% of outliers (allowed: 1.0%). Lower boundary - 97.5, upper boundary - 104.5.",
+            parameters=None,
+            filter=None,
+        ),
+        DQProfile(name="is_not_null", column="amount", description=None, parameters=None),
+        DQProfile(
+            name="min_max",
+            column="amount",
+            description="Real min/max values were used",
+            parameters={"max": 90, "min": 45},
+        ),
+        DQProfile(
+            name="has_no_outliers",
+            column="amount",
+            description="Column amount has 0.0% of outliers (allowed: 1.0%). Lower boundary - 7.5, upper boundary - 112.5.",
+            parameters=None,
+            filter=None,
+        ),
+        DQProfile(name="is_not_null_or_empty", column="status", description=None, parameters={"trim_strings": True}),
+        DQProfile(
+            name="is_unique",
+            column="order_id",
+            description="LLM-detected primary key columns: order_id",
             parameters={"nulls_distinct": False},
         ),
     ]
@@ -1828,7 +2065,7 @@ def test_profiler_with_pk_detection(spark, ws):
 def test_profile_table_with_pk_detection(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     # Use the same stable data pattern as test_profiler_with_pk_detection
     input_schema = T.StructType(
@@ -1879,9 +2116,9 @@ def test_profile_table_with_pk_detection(spark, ws, make_schema, make_random):
         ),
         DQProfile(name="is_not_null_or_empty", column="status", description=None, parameters={"trim_strings": True}),
         DQProfile(
-            name='is_unique',
-            column='order_id',
-            description='LLM-detected primary key columns: order_id',
+            name="is_unique",
+            column="order_id",
+            description="LLM-detected primary key columns: order_id",
             parameters={"nulls_distinct": False},
         ),
     ]
@@ -1903,7 +2140,7 @@ def test_profile_table_with_pk_detection(spark, ws, make_schema, make_random):
 def test_profile_tables_for_patterns_with_pk_detection(spark, ws, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     # Use meaningful column names and data patterns for stable LLM predictions
     input_schema = "order_id: int, customer_id: int, amount: int, status: string"
@@ -1925,32 +2162,32 @@ def test_profile_tables_for_patterns_with_pk_detection(spark, ws, make_schema, m
     ]
     profiles = profiler.profile_tables_for_patterns(patterns=[table_name], options=options)
     expected_profiles = [
-        DQProfile(name='is_not_null', column='order_id', description=None, parameters=None),
+        DQProfile(name="is_not_null", column="order_id", description=None, parameters=None),
         DQProfile(
-            name='min_max',
-            column='order_id',
-            description='Real min/max values were used',
-            parameters={'max': 5, 'min': 1},
+            name="min_max",
+            column="order_id",
+            description="Real min/max values were used",
+            parameters={"max": 5, "min": 1},
         ),
-        DQProfile(name='is_not_null', column='customer_id', description=None, parameters=None),
+        DQProfile(name="is_not_null", column="customer_id", description=None, parameters=None),
         DQProfile(
-            name='min_max',
-            column='customer_id',
-            description='Real min/max values were used',
-            parameters={'max': 102, 'min': 100},
+            name="min_max",
+            column="customer_id",
+            description="Real min/max values were used",
+            parameters={"max": 102, "min": 100},
         ),
-        DQProfile(name='is_not_null', column='amount', description=None, parameters=None),
+        DQProfile(name="is_not_null", column="amount", description=None, parameters=None),
         DQProfile(
-            name='min_max',
-            column='amount',
-            description='Real min/max values were used',
-            parameters={'max': 90, 'min': 45},
+            name="min_max",
+            column="amount",
+            description="Real min/max values were used",
+            parameters={"max": 90, "min": 45},
         ),
-        DQProfile(name='is_not_null_or_empty', column='status', description=None, parameters={'trim_strings': True}),
+        DQProfile(name="is_not_null_or_empty", column="status", description=None, parameters={"trim_strings": True}),
         DQProfile(
-            name='is_unique',
-            column='order_id',
-            description='LLM-detected primary key columns: order_id',
+            name="is_unique",
+            column="order_id",
+            description="LLM-detected primary key columns: order_id",
             parameters={"nulls_distinct": False},
         ),
     ]
@@ -2004,9 +2241,9 @@ def test_profiler_with_pk_detection_null_distinct(spark, ws):
             )
 
     expected_pk_profile = DQProfile(
-        name='is_unique',
-        column='user_id',
-        description='LLM-detected primary key columns: user_id',
+        name="is_unique",
+        column="user_id",
+        description="LLM-detected primary key columns: user_id",
         parameters={"nulls_distinct": False},
     )
 
@@ -2017,7 +2254,7 @@ def test_profiler_with_pk_detection_null_distinct(spark, ws):
 def test_profiler_detect_pk_from_table_with_llm(ws, spark, make_schema, make_random):
     catalog_name = TEST_CATALOG
     schema_name = make_schema(catalog_name=catalog_name).name
-    table_name = f"{catalog_name}.{schema_name}.{make_random(10).lower()}"
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
 
     input_schema = T.StructType(
         [
@@ -2117,3 +2354,69 @@ def test_profiler_count_distinct_computed(spark, ws):
 
     assert stats["color"]["count_distinct"] == 2
     assert stats["value"]["count_distinct"] == 3
+
+
+def test_profiler_generates_has_no_outliers_for_clean_numeric_data(spark, ws):
+    """End-to-end: has_no_outliers profile is emitted when the outlier fraction is below the threshold.
+
+    20 clean integer values → 0 outliers → 0 % < 1 % threshold → profile generated.
+    MAD bounds for [1..20]: median=10.5, MAD=5.0, bounds=(-7.0, 28.0) → no values outside.
+    """
+    schema = T.StructType([T.StructField("value", T.IntegerType())])
+    data = [(i,) for i in range(1, 21)]
+    input_df = spark.createDataFrame(data, schema)
+
+    profiler = DQProfiler(ws)
+    _, profiles = profiler.profile(
+        input_df,
+        options={
+            "sample_fraction": None,
+            "llm_primary_key_detection": False,
+            "remove_outliers": False,
+            "outliers_ratio": 0.01,
+            "has_no_outliers": True,
+        },
+    )
+
+    has_no_outliers_profiles = [p for p in profiles if p.name == "has_no_outliers"]
+    assert len(has_no_outliers_profiles) == 1
+    assert has_no_outliers_profiles[0].column == "value"
+    assert has_no_outliers_profiles[0].filter is None
+
+
+def test_profiler_no_has_no_outliers_when_outliers_exceed_threshold(spark, ws):
+    """End-to-end: has_no_outliers profile is suppressed when the outlier fraction exceeds the threshold.
+
+    7 values — 4 normal + 3 extreme → 3/7 ≈ 43 % > 10 % threshold → no profile.
+    MAD bounds: median=4, MAD=3, bounds=(-6.5, 14.5) → 100, 200, 300 are outliers.
+    """
+    schema = T.StructType([T.StructField("value", T.IntegerType())])
+    data = [(1,), (2,), (3,), (4,), (100,), (200,), (300,)]
+    input_df = spark.createDataFrame(data, schema)
+
+    profiler = DQProfiler(ws)
+    _, profiles = profiler.profile(
+        input_df,
+        options={
+            "sample_fraction": None,
+            "llm_primary_key_detection": False,
+            "outliers_ratio": 0.1,
+            "has_no_outliers": True,
+        },
+    )
+
+    has_no_outliers_profiles = [p for p in profiles if p.name == "has_no_outliers"]
+    assert len(has_no_outliers_profiles) == 0
+
+
+def _round_stats(
+    stats: dict[str, dict[str, int | float | None]], precision: int = 10
+) -> dict[str, dict[str, int | float | None]]:
+    """Rounds profiler stats to a specified precision (default 10 decimal places)."""
+    return {
+        column_name: {
+            metric_name: round(metric_val, precision) if isinstance(metric_val, float) else metric_val
+            for metric_name, metric_val in column_stats.items()
+        }
+        for column_name, column_stats in stats.items()
+    }

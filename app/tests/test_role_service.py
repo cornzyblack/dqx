@@ -1,11 +1,9 @@
-"""Tests for ``RoleService`` — primary-role resolution + RUNNER orthogonality.
+"""Tests for ``RoleService`` — primary-role resolution.
 
-The service hits Delta tables for mappings, but ``resolve_role`` and
-``has_runner_role`` accept a pre-cached mapping list. We swap the
+The service hits Delta tables for mappings, but ``resolve_role``
+accepts a pre-cached mapping list. We swap the
 mappings in via ``_mappings_cache`` so no SQL is touched.
 """
-
-from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
@@ -13,11 +11,23 @@ from datetime import datetime, timezone
 import pytest
 
 from databricks_labs_dqx_app.backend.common.authorization import UserRole
-from databricks_labs_dqx_app.backend.services.role_service import RoleMapping, RoleService
+from databricks_labs_dqx_app.backend.services.role_service import (
+    RoleMapping,
+    RoleMappingHistoryEntry,
+    RoleService,
+)
 
 
 @pytest.fixture
 def role_service(sql_executor_mock):
+    # ``fqn`` and ``ts_text`` are passthroughs so the SQL strings the
+    # service emits stay inspectable in tests. The Protocol contract is
+    # that ``fqn(t)`` returns a fully-qualified identifier and
+    # ``ts_text(c)`` returns a SELECT-projection-safe expression — both
+    # are dialect-specific, but the tests only care about the literal
+    # column / table name appearing in the right slot.
+    sql_executor_mock.fqn.side_effect = lambda t: t
+    sql_executor_mock.ts_text.side_effect = lambda c: c
     svc = RoleService(sql=sql_executor_mock)
     return svc
 
@@ -85,66 +95,48 @@ class TestResolveRolePrimary:
         )
         assert role_service.resolve_role(["platform-admins", "approvers"]) == UserRole.ADMIN
 
+    def test_user_level_entitlement_resolves(self, role_service):
+        # USER-level entitlements store the user's own identity string in the
+        # ``group_name`` column. The caller (get_user_role) folds the user's
+        # identity into the list it passes, so a mapping keyed on the user's
+        # email/username must resolve the same as a group mapping would.
+        _seed_mappings(role_service, [(UserRole.RULE_APPROVER.value, "alice@example.com")])
+        assert role_service.resolve_role(["alice@example.com"]) == UserRole.RULE_APPROVER
 
-# ---------------------------------------------------------------------------
-# resolve_role — RUNNER must NOT show up as a primary role
-# ---------------------------------------------------------------------------
-
-
-class TestResolveRoleRunnerOrthogonality:
-    def test_runner_only_user_resolves_to_viewer(self, role_service):
-        # The orthogonality contract: a group mapped only to RUNNER must not
-        # promote the primary role above VIEWER.
-        _seed_mappings(role_service, [(UserRole.RUNNER.value, "runners")])
-        assert role_service.resolve_role(["runners"]) == UserRole.VIEWER
-
-    def test_runner_plus_author_resolves_to_author_not_higher(self, role_service):
+    def test_user_level_entitlement_beats_group_when_higher(self, role_service):
+        # A user's direct ADMIN entitlement out-ranks a lower group mapping.
         _seed_mappings(
             role_service,
             [
-                (UserRole.RUNNER.value, "runners"),
+                (UserRole.ADMIN.value, "alice@example.com"),
+                (UserRole.RULE_AUTHOR.value, "writers"),
+            ],
+        )
+        # Caller passes both group memberships and the user's own identity.
+        assert role_service.resolve_role(["writers", "alice@example.com"]) == UserRole.ADMIN
+
+
+# ---------------------------------------------------------------------------
+# resolve_role — unknown/stale role strings in DB are silently skipped
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRoleUnknownMapping:
+    def test_unknown_role_string_is_silently_skipped(self, role_service):
+        # A DB row with a stale role value (e.g. the old "runner" string) must
+        # not crash resolve_role — it should be skipped via the ValueError path.
+        _seed_mappings(role_service, [("runner", "runners")])
+        assert role_service.resolve_role(["runners"]) == UserRole.VIEWER
+
+    def test_unknown_role_alongside_known_resolves_to_known(self, role_service):
+        _seed_mappings(
+            role_service,
+            [
+                ("runner", "runners"),
                 (UserRole.RULE_AUTHOR.value, "writers"),
             ],
         )
         assert role_service.resolve_role(["runners", "writers"]) == UserRole.RULE_AUTHOR
-
-
-# ---------------------------------------------------------------------------
-# has_runner_role
-# ---------------------------------------------------------------------------
-
-
-class TestHasRunnerRole:
-    def test_admin_is_implicit_runner(self, role_service):
-        # Member of the bootstrap admin group is always a runner, even with
-        # no explicit RUNNER mapping configured.
-        _seed_mappings(role_service, [])
-        assert role_service.has_runner_role(["admins"], admin_group="admins") is True
-
-    def test_explicit_runner_group_membership(self, role_service):
-        _seed_mappings(role_service, [(UserRole.RUNNER.value, "runners")])
-        assert role_service.has_runner_role(["runners"], admin_group="other-admins") is True
-
-    def test_no_runner_mapping_no_admin_returns_false(self, role_service):
-        _seed_mappings(role_service, [(UserRole.RULE_AUTHOR.value, "writers")])
-        assert role_service.has_runner_role(["writers"], admin_group="other-admins") is False
-
-    def test_author_role_does_not_imply_runner(self, role_service):
-        # The whole point of orthogonality: RULE_AUTHOR alone does NOT
-        # confer runner privilege.
-        _seed_mappings(role_service, [(UserRole.RULE_AUTHOR.value, "writers")])
-        assert role_service.has_runner_role(["writers"], admin_group="other-admins") is False
-
-    def test_approver_role_does_not_imply_runner(self, role_service):
-        _seed_mappings(role_service, [(UserRole.RULE_APPROVER.value, "approvers")])
-        assert role_service.has_runner_role(["approvers"], admin_group="other-admins") is False
-
-    def test_no_mappings_only_admin_check(self, role_service):
-        _seed_mappings(role_service, [])
-        # Admin-group-via-bootstrap path still works when no DB mappings exist.
-        assert role_service.has_runner_role(["admins"], admin_group="admins") is True
-        # And non-admins are not runners with empty mappings.
-        assert role_service.has_runner_role(["data-eng"], admin_group="admins") is False
 
 
 # ---------------------------------------------------------------------------
@@ -201,11 +193,15 @@ class TestCreateMappingDelegatesToProtocol:
             user_email="alice@example.com",
         )
 
-        # The service MUST funnel everything through the Protocol's
-        # upsert_with_audit. Going around it (e.g. via .execute()) would
-        # mean the dialect branch came back.
+        # The primary mutation MUST go through the Protocol's
+        # upsert_with_audit. Going around it (e.g. by hand-building a
+        # MERGE/INSERT string and calling .execute()) would mean the
+        # dialect branch came back. The single .execute() call we DO
+        # expect is the best-effort history-row INSERT, covered by
+        # TestCreateMappingHistoryRecording below — assertions there
+        # lock down its shape so it can't accidentally absorb the
+        # primary write.
         sql_executor_mock.upsert_with_audit.assert_called_once()
-        sql_executor_mock.execute.assert_not_called()
 
         call = sql_executor_mock.upsert_with_audit.call_args
         # Audit semantics: preserve created_* on UPDATE; no version column.
@@ -235,3 +231,133 @@ class TestCreateMappingDelegatesToProtocol:
             role_service.create_mapping(role="not-a-real-role", group_name="g", user_email="u@x")
         sql_executor_mock.upsert_with_audit.assert_not_called()
         sql_executor_mock.execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Audit history — every mutation must land a row in
+# ``dq_role_mappings_history`` so the audit trail survives even after the
+# live mapping is deleted. The pattern mirrors
+# ``RulesCatalogService._record_history`` / ``ScheduleConfigService._record_history``.
+# ---------------------------------------------------------------------------
+
+
+def _history_inserts(sql_executor_mock) -> list[str]:
+    """Return the SQL strings of every ``INSERT INTO ... _history`` call."""
+    return [
+        call.args[0]
+        for call in sql_executor_mock.execute.call_args_list
+        if call.args and "INSERT INTO" in call.args[0] and "history" in call.args[0]
+    ]
+
+
+class TestCreateMappingHistoryRecording:
+    def test_create_records_create_action_in_history(self, role_service, sql_executor_mock):
+        role_service.create_mapping(
+            role=UserRole.RULE_APPROVER.value,
+            group_name="approvers",
+            user_email="alice@example.com",
+        )
+        inserts = _history_inserts(sql_executor_mock)
+        assert len(inserts) == 1, f"expected exactly one history INSERT, got: {inserts}"
+        sql = inserts[0]
+        assert "'create'" in sql
+        assert f"'{UserRole.RULE_APPROVER.value}'" in sql
+        assert "'approvers'" in sql
+        assert "'alice@example.com'" in sql
+        # Timestamps must come from the DB, not the app process clock,
+        # so the audit log doesn't drift with app server timezone bugs.
+        assert "now()" in sql
+
+    def test_history_failure_does_not_break_primary_write(self, role_service, sql_executor_mock):
+        # The history INSERT is best-effort — losing one audit row is
+        # less harmful than refusing a legitimate admin change.
+        # Simulate a Postgres serialization error on the history table.
+        sql_executor_mock.execute.side_effect = RuntimeError("history table unavailable")
+
+        # Should not raise — primary upsert already succeeded.
+        result = role_service.create_mapping(
+            role=UserRole.VIEWER.value,
+            group_name="viewers",
+            user_email="bob@example.com",
+        )
+        assert result.role == UserRole.VIEWER.value
+        sql_executor_mock.upsert_with_audit.assert_called_once()
+
+
+class TestDeleteMappingHistoryRecording:
+    def test_delete_records_delete_action_in_history(self, role_service, sql_executor_mock):
+        role_service.delete_mapping(
+            role=UserRole.RULE_AUTHOR.value,
+            group_name="writers",
+            user_email="charlie@example.com",
+        )
+        # Two execute() calls: the DELETE against dq_role_mappings, then
+        # the INSERT into dq_role_mappings_history.
+        inserts = _history_inserts(sql_executor_mock)
+        assert len(inserts) == 1, f"expected exactly one history INSERT, got: {inserts}"
+        sql = inserts[0]
+        assert "'delete'" in sql
+        assert f"'{UserRole.RULE_AUTHOR.value}'" in sql
+        assert "'writers'" in sql
+        assert "'charlie@example.com'" in sql
+
+    def test_delete_without_user_email_records_null_actor(self, role_service, sql_executor_mock):
+        # Legacy call sites that don't pass user_email still produce an
+        # audit row (with changed_by = NULL) — the audit trail prefers
+        # an anonymous row over a missing one.
+        role_service.delete_mapping(role=UserRole.VIEWER.value, group_name="viewers")
+        inserts = _history_inserts(sql_executor_mock)
+        assert len(inserts) == 1
+        sql = inserts[0]
+        assert "'delete'" in sql
+        # NULL appears unquoted — confirms we didn't stringify None.
+        assert "NULL" in sql
+
+    def test_history_failure_does_not_break_delete(self, role_service, sql_executor_mock):
+        # First execute() call (DELETE) succeeds; second (history INSERT)
+        # fails. The mapping deletion has already committed so the
+        # service must not propagate the failure.
+        outcomes = [None, RuntimeError("history table unavailable")]
+
+        def _exec(_sql):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+
+        sql_executor_mock.execute.side_effect = _exec
+        role_service.delete_mapping(
+            role=UserRole.VIEWER.value,
+            group_name="viewers",
+            user_email="dan@example.com",
+        )
+
+
+class TestListHistory:
+    def test_list_history_orders_newest_first_with_limit(self, role_service, sql_executor_mock):
+        # Build two rows that look like what the executor's ``.query()``
+        # returns: list[tuple[role, group_name, action, changed_by, changed_at]].
+        sql_executor_mock.query.return_value = [
+            (UserRole.RULE_APPROVER.value, "approvers", "create", "alice@example.com", "2026-01-02T00:00:00+00:00"),
+            (UserRole.RULE_APPROVER.value, "approvers", "delete", "alice@example.com", "2026-01-01T00:00:00+00:00"),
+        ]
+        entries = role_service.list_history(limit=50)
+        assert [e.action for e in entries] == ["create", "delete"]
+        assert all(isinstance(e, RoleMappingHistoryEntry) for e in entries)
+
+        sent_sql = sql_executor_mock.query.call_args.args[0]
+        assert "ORDER BY changed_at DESC" in sent_sql
+        assert "LIMIT 50" in sent_sql
+
+    def test_list_history_clamps_limit(self, role_service, sql_executor_mock):
+        # Hostile callers can't OOM the app by passing a huge limit.
+        sql_executor_mock.query.return_value = []
+        role_service.list_history(limit=10_000_000)
+        sent_sql = sql_executor_mock.query.call_args.args[0]
+        assert "LIMIT 1000" in sent_sql
+
+    def test_list_history_applies_filters(self, role_service, sql_executor_mock):
+        sql_executor_mock.query.return_value = []
+        role_service.list_history(role=UserRole.ADMIN.value, group_name="platform-admins")
+        sent_sql = sql_executor_mock.query.call_args.args[0]
+        assert f"role = '{UserRole.ADMIN.value}'" in sent_sql
+        assert "group_name = 'platform-admins'" in sent_sql

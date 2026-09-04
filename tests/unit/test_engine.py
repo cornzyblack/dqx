@@ -1,14 +1,17 @@
+import re
 from datetime import datetime, timezone
 from unittest.mock import create_autospec, Mock
 
 import pytest
 import pyspark.sql.functions as F
-from pyspark.sql import SparkSession
+from pyspark.errors import AnalysisException
+from pyspark.sql import Column, SparkSession
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import DatabricksError
 
-from databricks.labs.dqx.__about__ import __version__
+from databricks.labs.dqx import engine as engine_module
+from databricks.labs.dqx.__version__ import __version__
 from databricks.labs.dqx.config import ExtraParams
 from databricks.labs.dqx.checks_storage import (
     BaseChecksStorageHandlerFactory,
@@ -16,10 +19,13 @@ from databricks.labs.dqx.checks_storage import (
     BaseChecksStorageConfig,
 )
 from databricks.labs.dqx.config import InputConfig, OutputConfig
+from databricks.labs.dqx.base import DQEngineBase
 from databricks.labs.dqx.engine import DQEngine, DQEngineCore
-from databricks.labs.dqx.engine import InvalidParameterError
+from databricks.labs.dqx.engine import InvalidCheckError, InvalidParameterError
 from databricks.labs.dqx.metrics_observer import DQMetricsObserver
-from databricks.labs.dqx.rule import DQDatasetRule
+from databricks.labs.dqx.rule import DQDatasetRule, CHECK_FUNC_REGISTRY_ORIGINAL_COLUMNS_PRESELECTION
+from databricks.labs.dqx.check_funcs import make_condition
+from databricks.labs.dqx.rule import DQRowRule, register_rule, requires_dbr_version
 
 
 def test_engine_creation():
@@ -93,8 +99,10 @@ def test_engine_creation_no_workspace_connection(mock_workspace_client, mock_spa
 
 
 def test_get_streaming_metrics_listener_invalid_engine(mock_workspace_client, mock_spark):
-    engine = DQEngine(mock_workspace_client, mock_spark)
-    with pytest.raises(InvalidParameterError, match="Metrics cannot be collected for engine"):
+    # Inject a non-DQEngineCore engine (autospec of the base class) to exercise the engine-type guard.
+    non_core_engine = create_autospec(DQEngineBase)
+    engine = DQEngine(mock_workspace_client, mock_spark, engine=non_core_engine)
+    with pytest.raises(InvalidParameterError, match="Metrics cannot be collected for engine with type"):
         engine.get_streaming_metrics_listener(metrics_config=OutputConfig(location="dummy"))
 
 
@@ -240,3 +248,345 @@ def test_apply_checks_and_save_in_table_empty_checks_does_not_load_from_location
         )
 
     mock_factory.create_for_location.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("save_method_name", "apply_method_name"),
+    [
+        ("apply_checks_and_save_in_table", "apply_checks"),
+        ("apply_checks_by_metadata_and_save_in_table", "apply_checks_by_metadata"),
+    ],
+)
+def test_apply_checks_and_save_in_table_allows_metrics_only(
+    mock_workspace_client, mock_spark, monkeypatch, save_method_name, apply_method_name
+):
+    engine = DQEngine(mock_workspace_client, mock_spark, observer=DQMetricsObserver())
+    checked_df = Mock()
+    observation = Mock()
+    observation.get = {"input_row_count": 2}
+    apply_checks = Mock(return_value=(checked_df, observation))
+    save_summary_metrics = Mock()
+    read_input_data = Mock(return_value=Mock())
+
+    monkeypatch.setattr(engine, apply_method_name, apply_checks)
+    monkeypatch.setattr(engine, "save_summary_metrics", save_summary_metrics)
+    monkeypatch.setattr(engine_module, "read_input_data", read_input_data)
+
+    save_method = getattr(engine, save_method_name)
+    save_method(
+        input_config=InputConfig(location="catalog.schema.input"),
+        checks=[],
+        metrics_config=OutputConfig(location="catalog.schema.metrics"),
+    )
+
+    checked_df.count.assert_called_once_with()
+    save_summary_metrics.assert_called_once()
+    _, save_metrics_kwargs = save_summary_metrics.call_args
+    assert save_metrics_kwargs["observed_metrics"] == {"input_row_count": 2}
+    assert save_metrics_kwargs["metrics_config"] == OutputConfig(location="catalog.schema.metrics")
+
+
+@pytest.mark.parametrize(
+    "save_method_name",
+    ["apply_checks_and_save_in_table", "apply_checks_by_metadata_and_save_in_table"],
+)
+def test_apply_checks_and_save_in_table_metrics_only_requires_observer(
+    mock_workspace_client, mock_spark, save_method_name
+):
+    engine = DQEngine(mock_workspace_client, mock_spark)
+    save_method = getattr(engine, save_method_name)
+
+    with pytest.raises(InvalidParameterError, match="Metrics cannot be collected for engine with no observer"):
+        save_method(
+            input_config=InputConfig(location="catalog.schema.input"),
+            checks=[],
+            metrics_config=OutputConfig(location="catalog.schema.metrics"),
+        )
+
+
+@pytest.mark.parametrize(
+    "save_method_name",
+    ["apply_checks_and_save_in_table", "apply_checks_by_metadata_and_save_in_table"],
+)
+def test_apply_checks_and_save_in_table_metrics_with_output_requires_observer(
+    mock_workspace_client, mock_spark, save_method_name
+):
+    """metrics_config requested alongside output_config but with no observer must fail fast rather than
+    silently skipping the metrics table."""
+    engine = DQEngine(mock_workspace_client, mock_spark)  # no observer
+    save_method = getattr(engine, save_method_name)
+
+    with pytest.raises(InvalidParameterError, match="Metrics cannot be collected for engine with no observer"):
+        save_method(
+            input_config=InputConfig(location="catalog.schema.input"),
+            output_config=OutputConfig(location="catalog.schema.output"),
+            checks=[],
+            metrics_config=OutputConfig(location="catalog.schema.metrics"),
+        )
+
+
+@pytest.mark.parametrize(
+    "save_method_name",
+    ["apply_checks_and_save_in_table", "apply_checks_by_metadata_and_save_in_table"],
+)
+def test_apply_checks_and_save_in_table_metrics_only_streaming_unsupported(
+    mock_workspace_client, mock_spark, save_method_name
+):
+    engine = DQEngine(mock_workspace_client, mock_spark, observer=DQMetricsObserver())
+    save_method = getattr(engine, save_method_name)
+
+    with pytest.raises(InvalidParameterError, match="Metrics-only writes are not supported for streaming input"):
+        save_method(
+            input_config=InputConfig(location="catalog.schema.input", is_streaming=True),
+            checks=[],
+            metrics_config=OutputConfig(location="catalog.schema.metrics"),
+        )
+
+
+def test_apply_checks_and_save_in_table_raises_when_no_destination_configs(mock_workspace_client, mock_spark):
+    engine = DQEngine(mock_workspace_client, mock_spark)
+    with pytest.raises(
+        InvalidParameterError,
+        match="At least one of 'output_config', 'quarantine_config' or 'metrics_config' must be provided",
+    ):
+        engine.apply_checks_and_save_in_table(
+            input_config=InputConfig(location="catalog.schema.input"),
+            checks=[],
+        )
+
+
+def test_apply_checks_by_metadata_and_save_in_table_raises_when_no_destination_configs(
+    mock_workspace_client, mock_spark
+):
+    engine = DQEngine(mock_workspace_client, mock_spark)
+    with pytest.raises(
+        InvalidParameterError,
+        match="At least one of 'output_config', 'quarantine_config' or 'metrics_config' must be provided",
+    ):
+        engine.apply_checks_by_metadata_and_save_in_table(
+            input_config=InputConfig(location="catalog.schema.input"),
+            checks=[],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: _preselect_original_columns uses DQRule.replace() correctly
+# ---------------------------------------------------------------------------
+
+
+def _preselect_dataset_check():
+    """Minimal dataset check accepted by _preselect_original_columns tests."""
+    return F.lit(True), lambda df, col_name: df.withColumn(col_name, F.lit(True))
+
+
+def test_preselect_original_columns_no_op_when_func_not_registered():
+    """_preselect_original_columns returns the same rule object when the check function
+    is not in CHECK_FUNC_REGISTRY_ORIGINAL_COLUMNS_PRESELECTION."""
+    spark_mock = create_autospec(SparkSession)
+    ws = create_autospec(WorkspaceClient)
+    engine = DQEngineCore(spark=spark_mock, workspace_client=ws)
+
+    rule = DQDatasetRule(check_func=_preselect_dataset_check)
+    assert _preselect_dataset_check.__name__ not in CHECK_FUNC_REGISTRY_ORIGINAL_COLUMNS_PRESELECTION
+
+    df = Mock()
+    df.columns = ["id", "name", "_errors", "_warnings"]
+    result = engine._preselect_original_columns(df, rule)
+
+    assert result is rule  # no change — same object returned
+
+
+def test_preselect_original_columns_injects_df_columns(monkeypatch):
+    """_preselect_original_columns must inject df columns (minus result columns) into
+    check_func_kwargs["columns"] via DQRule.replace() when the check function is registered
+    for original-columns preselection and no columns are already provided."""
+    spark_mock = create_autospec(SparkSession)
+    ws = create_autospec(WorkspaceClient)
+    engine = DQEngineCore(spark=spark_mock, workspace_client=ws)
+
+    monkeypatch.setattr(
+        engine_module,
+        "CHECK_FUNC_REGISTRY_ORIGINAL_COLUMNS_PRESELECTION",
+        {_preselect_dataset_check.__name__},
+    )
+
+    rule = DQDatasetRule(check_func=_preselect_dataset_check)
+
+    df = Mock()
+    df.columns = ["id", "name", "_errors", "_warnings"]
+
+    result = engine._preselect_original_columns(df, rule)
+
+    assert result is not rule  # new object produced by replace()
+    assert result.check_func_kwargs["columns"] == ["id", "name"]
+
+
+def test_preselect_original_columns_no_op_when_columns_already_in_kwargs(monkeypatch):
+    """_preselect_original_columns must not overwrite columns already in check_func_kwargs."""
+    spark_mock = create_autospec(SparkSession)
+    ws = create_autospec(WorkspaceClient)
+    engine = DQEngineCore(spark=spark_mock, workspace_client=ws)
+
+    monkeypatch.setattr(
+        engine_module,
+        "CHECK_FUNC_REGISTRY_ORIGINAL_COLUMNS_PRESELECTION",
+        {_preselect_dataset_check.__name__},
+    )
+
+    rule = DQDatasetRule(check_func=_preselect_dataset_check, check_func_kwargs={"columns": ["id"]})
+
+    df = Mock()
+    df.columns = ["id", "name", "_errors", "_warnings"]
+
+    result = engine._preselect_original_columns(df, rule)
+
+    assert result is rule  # early-return — columns already provided
+
+
+# --- DBR version validation error path tests ---
+
+
+@requires_dbr_version("15.0")
+@register_rule("row")
+def _check_requires_dbr_15(column: str) -> Column:
+    return make_condition(F.col(column).isNull(), f"'{column}' is null", f"{column}_is_null")
+
+
+@requires_dbr_version("17.1")
+@register_rule("row")
+def _check_requires_dbr_17_1(column: str) -> Column:
+    return make_condition(F.col(column).isNull(), f"'{column}' is null", f"{column}_is_null")
+
+
+@requires_dbr_version("999.0")
+@register_rule("row")
+def _check_requires_dbr_max(column: str) -> Column:
+    return make_condition(F.col(column).isNull(), f"'{column}' is null", f"{column}_is_null")
+
+
+def _engine_with_sql_side_effect(side_effect):
+    ws = create_autospec(WorkspaceClient)
+    spark = create_autospec(SparkSession)
+    spark.sql.side_effect = side_effect
+    return DQEngineCore(workspace_client=ws, spark=spark)
+
+
+def _engine_returning_dbr_version(version_str):
+    ws = create_autospec(WorkspaceClient)
+    spark = create_autospec(SparkSession)
+    row = Mock()
+    row.__getitem__ = Mock(return_value=version_str)
+    spark.sql.return_value.collect.return_value = [row]
+    return DQEngineCore(workspace_client=ws, spark=spark)
+
+
+def test_apply_checks_raises_invalid_check_error_when_spark_sql_fails():
+    engine = _engine_with_sql_side_effect(AnalysisException("current_version() not found"))
+    df = Mock()
+    df.columns = ["a"]
+    with pytest.raises(InvalidCheckError, match="can only run on Databricks Runtime"):
+        engine.apply_checks(df, [DQRowRule(check_func=_check_requires_dbr_15, column="a")])
+
+
+def test_apply_checks_raises_invalid_check_error_when_dbr_version_unparseable():
+    engine = _engine_returning_dbr_version("custom-build")
+    df = Mock()
+    df.columns = ["a"]
+    with pytest.raises(InvalidCheckError, match="Cannot parse Databricks Runtime version"):
+        engine.apply_checks(df, [DQRowRule(check_func=_check_requires_dbr_15, column="a")])
+
+
+@pytest.mark.parametrize("dbr_version", ["17.0", "16.4", "9.1"])
+def test_apply_checks_raises_when_minor_version_below_required(dbr_version):
+    # Required 17.1; a lower (major, minor) - including 17.0, the same major - must fail. Guards against a
+    # regression to major-only comparison, which would wrongly let 17.0 through.
+    engine = _engine_returning_dbr_version(dbr_version)
+    df = Mock()
+    df.columns = ["a"]
+    with pytest.raises(InvalidCheckError, match=r"require Databricks Runtime >= 17\.1"):
+        engine.apply_checks(df, [DQRowRule(check_func=_check_requires_dbr_17_1, column="a")])
+
+
+@pytest.mark.parametrize(
+    "dbr_version, required_check",
+    [
+        # A suffixed runtime string such as "15.4 LTS" must parse to (15, 4) rather than hard-fail.
+        ("15.4 LTS", _check_requires_dbr_17_1),
+        # Serverless reports e.g. "18.2.x-photon-scala2.13"; it must parse to (18, 2), not hard-fail.
+        ("18.2.x-photon-scala2.13", _check_requires_dbr_max),
+        # Bare-major serverless form below the required major: "16.x" must fail a 17.1 requirement.
+        ("16.x-photon-scala2.13", _check_requires_dbr_17_1),
+    ],
+)
+def test_apply_checks_parses_dbr_version_with_suffix(dbr_version, required_check):
+    # Asserting the version is compared (and echoed back) against a higher requirement proves the leading
+    # major.minor was parsed and the suffix ignored, rather than the parse hard-failing.
+    engine = _engine_returning_dbr_version(dbr_version)
+    df = Mock()
+    df.columns = ["a"]
+    with pytest.raises(
+        InvalidCheckError,
+        match=rf"require Databricks Runtime >= .*but the current version is {re.escape(dbr_version)}",
+    ):
+        engine.apply_checks(df, [DQRowRule(check_func=required_check, column="a")])
+
+
+def _observer_core_with_pipeline_conf(pipelines_id: str | None) -> DQEngineCore:
+    """Build a DQEngineCore with an observer and a spark whose 'pipelines.id' conf is (un)set."""
+    spark_mock = create_autospec(SparkSession)
+    spark_mock.conf = Mock()
+    spark_mock.conf.get.return_value = pipelines_id  # None => not a pipeline; a value => inside a pipeline
+    ws = create_autospec(WorkspaceClient)
+    observer = DQMetricsObserver(name="test_observer")
+    return DQEngineCore(spark=spark_mock, workspace_client=ws, observer=observer)
+
+
+def test_apply_checks_skips_observe_in_declarative_pipeline():
+    """Inside a Spark Declarative Pipeline, apply_checks returns a bare DataFrame and does not wire observe()."""
+    core = _observer_core_with_pipeline_conf("pipeline-123")
+
+    checked_df = Mock()
+    checked_df.observe.return_value = Mock()
+    df = Mock()
+    df.columns = ["id", "name"]
+    df.select.return_value = checked_df  # _append_empty_checks builds the checked df via df.select(...)
+
+    result = core.apply_checks(df, [])
+
+    # observe() is inaccessible in a pipeline, so it is skipped: bare DataFrame, no observation, no observe() call.
+    assert not isinstance(result, tuple)
+    checked_df.observe.assert_not_called()
+
+
+def test_apply_checks_wires_observe_outside_declarative_pipeline():
+    """Outside a Spark Declarative Pipeline, apply_checks wires observe() and returns a (DataFrame, Observation)."""
+    core = _observer_core_with_pipeline_conf(None)
+
+    checked_df = Mock()
+    checked_df.isStreaming = False
+    checked_df.observe.return_value = Mock()
+    df = Mock()
+    df.columns = ["id", "name"]
+    df.select.return_value = checked_df
+
+    result = core.apply_checks(df, [])
+
+    assert isinstance(result, tuple)
+    checked_df.observe.assert_called_once()
+
+
+def test_compute_summary_metrics_raises_without_observer(mock_workspace_client, mock_spark):
+    """compute_summary_metrics requires an observer on the engine and raises when none is configured."""
+    engine = DQEngine(mock_workspace_client, mock_spark)
+    with pytest.raises(InvalidParameterError, match="no observer"):
+        engine.compute_summary_metrics(Mock(), checks=[])
+
+
+def test_compute_summary_metrics_raises_when_result_columns_missing(mock_workspace_client, mock_spark):
+    """compute_summary_metrics fails early with a clear error if checked_df lacks the DQX result columns
+    (e.g. the caller passed a DataFrame after get_valid / get_invalid dropped _errors / _warnings)."""
+    engine = DQEngine(mock_workspace_client, mock_spark, observer=DQMetricsObserver())
+    checked_df = Mock()
+    checked_df.columns = ["id", "name"]  # no _errors / _warnings columns
+    with pytest.raises(InvalidParameterError, match="missing the DQX result column"):
+        engine.compute_summary_metrics(checked_df)

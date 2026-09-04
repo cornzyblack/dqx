@@ -10,9 +10,10 @@ from pyspark.sql.types import (
     StructType,
 )
 
-from databricks.labs.dqx.anomaly.anomaly_info_schema import anomaly_info_struct_schema
+from databricks.labs.dqx.anomaly.anomaly_info_schema import ai_explanation_struct_schema, anomaly_info_struct_schema
 from databricks.labs.dqx.anomaly.segment_utils import canonicalize_segment_values
 from databricks.labs.dqx.errors import InvalidParameterError
+from databricks.labs.dqx.utils import safe_filter_expr
 from databricks.labs.dqx.schema.dq_info_schema import (
     build_dq_info_struct,
     register_dq_info_field,
@@ -67,6 +68,7 @@ def add_info_column(
     segment_values: dict[str, str] | None = None,
     enable_contributions: bool = False,
     enable_confidence_std: bool = False,
+    ai_explanation_col: str | None = None,
     score_col: str = "anomaly_score",
     score_std_col: str = "anomaly_score_std",
     contributions_col: str = "anomaly_contributions",
@@ -82,6 +84,8 @@ def add_info_column(
         segment_values: Segment values if model is segmented (None for global models).
         enable_contributions: Whether anomaly_contributions are available (0–100 percent).
         enable_confidence_std: Whether anomaly_score_std is available.
+        ai_explanation_col: Optional column name carrying the pre-computed AI explanation struct.
+            When provided and present on df, it is packaged into _dq_info.
         score_col: Column name for anomaly scores (internal, collision-safe).
         score_std_col: Column name for ensemble std scores (internal, collision-safe).
         contributions_col: Column name for SHAP contributions (internal, collision-safe, 0–100 percent).
@@ -109,9 +113,14 @@ def add_info_column(
     else:
         anomaly_info_fields["segment"] = F.lit(None).cast(MapType(StringType(), StringType()))
 
-    # Add contributions (null if not requested or not available)
+    # Add contributions (null if not requested or not available). Contributions are only
+    # surfaced for anomalous rows: SHAP is computed just for rows at or above the threshold
+    # (see compute_gated_shap_contributions) and this gate makes the observable contract
+    # exact — non-anomalous rows always carry a null map.
     if enable_contributions and contributions_col in df.columns:
-        anomaly_info_fields["contributions"] = F.col(contributions_col)
+        anomaly_info_fields["contributions"] = F.when(
+            F.col(severity_col) >= F.lit(threshold), F.col(contributions_col)
+        ).otherwise(F.lit(None).cast(MapType(StringType(), DoubleType())))
     else:
         anomaly_info_fields["contributions"] = F.lit(None).cast(MapType(StringType(), DoubleType()))
 
@@ -120,6 +129,12 @@ def add_info_column(
         anomaly_info_fields["confidence_std"] = F.col(score_std_col)
     else:
         anomaly_info_fields["confidence_std"] = F.lit(None).cast(DoubleType())
+
+    # Add ai_explanation (null when not requested or column not present)
+    if ai_explanation_col and ai_explanation_col in df.columns:
+        anomaly_info_fields["ai_explanation"] = F.col(ai_explanation_col)
+    else:
+        anomaly_info_fields["ai_explanation"] = F.lit(None).cast(ai_explanation_struct_schema)
 
     anomaly_info = F.struct(*[value.alias(key) for key, value in anomaly_info_fields.items()]).cast(
         anomaly_info_struct_schema
@@ -234,4 +249,4 @@ def apply_row_filter(df: DataFrame, row_filter: str | None) -> DataFrame:
     row_filter is a SQL expression (e.g. \"region = 'US'\"). Only these rows are run
     through anomaly detection; elsewhere we join results back so output has same row count.
     """
-    return df.filter(F.expr(row_filter)) if row_filter else df
+    return df.filter(safe_filter_expr(row_filter)) if row_filter else df

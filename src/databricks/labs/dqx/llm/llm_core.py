@@ -1,16 +1,68 @@
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from functools import cached_property
 
 import dspy  # type: ignore
 
 from databricks.labs.dqx.config import LLMModelConfig
-from databricks.labs.dqx.llm.llm_utils import create_optimizer_training_set, create_optimizer_training_set_with_stats
+from databricks.labs.dqx.llm.llm_utils import (
+    create_optimizer_training_set,
+    create_optimizer_training_set_with_stats,
+    extract_json_rules,
+)
+from databricks.labs.dqx.utils import is_sql_query_safe
 from databricks.labs.dqx.llm.optimizers import BootstrapFewShotOptimizer
 from databricks.labs.dqx.llm.validators import RuleValidator
 
 logger = logging.getLogger(__name__)
+
+
+def _filter_unsafe_sql_rules(rules: object) -> list[dict]:
+    """Filter out any sql_query rules whose query argument fails the SQL safety check.
+
+    Accepts a pre-parsed rules value and drops every rule where *check.function* is
+    *sql_query* and the *query* argument is not a string or does not pass
+    *is_sql_query_safe*. All other rules are returned unchanged. Non-list input
+    returns an empty list.
+
+    Args:
+        rules: Parsed rules value (expected to be a list of rule dicts).
+
+    Returns:
+        List of safe rules with unsafe sql_query rules removed.
+    """
+    if not isinstance(rules, list):
+        return []
+
+    safe_rules: list[dict] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+
+        check = rule.get("check", {})
+        if not isinstance(check, dict):
+            continue
+
+        if check.get("function") == "sql_query":
+            arguments = check.get("arguments", {})
+            if not isinstance(arguments, dict):
+                continue
+
+            query = arguments.get("query")
+            if not isinstance(query, str):
+                logger.warning(f"LLM-generated sql_query rule dropped: non-string query argument {query!r}")
+                continue
+            if not is_sql_query_safe(query):
+                # Strip control characters before logging to prevent log injection (CWE-117)
+                safe_repr = repr(query.replace("\n", " ").replace("\r", " "))
+                logger.warning(f"LLM-generated sql_query rule dropped: unsafe SQL query {safe_repr}")
+                continue
+
+        safe_rules.append(rule)
+
+    return safe_rules
 
 
 class LLMModelConfigurator:
@@ -31,6 +83,9 @@ class LLMModelConfigurator:
         """
         Create an LM instance with current config for per-request override.
 
+        Budget caps (max_tokens, temperature, timeout) come from *LLMModelConfig* and are forwarded
+        to litellm via dspy.LM kwargs to bound cost and latency on pathological prompts (OWASP LLM04).
+
         Returns:
             A new LM instance configured with the current model config.
         """
@@ -39,8 +94,25 @@ class LLMModelConfigurator:
             model_type="chat",
             api_key=self._model_config.api_key or "",
             api_base=self._model_config.api_base or "",
-            max_retries=3,
+            max_tokens=self._model_config.max_tokens,
+            temperature=self._model_config.temperature,
+            timeout=self._model_config.timeout,
+            max_retries=self._model_config.max_retries,
         )
+
+    @contextmanager
+    def lm_context(self) -> Iterator[None]:
+        """
+        Scope a block of work to a freshly created LM instance.
+
+        Each call creates a new LM so that the current credentials are picked up, rather than relying
+        on a globally configured model. Use this to wrap any DSPy module invocation.
+
+        Yields:
+            None. The LM is active for the duration of the *with* block.
+        """
+        with dspy.settings.context(lm=self.create_lm()):
+            yield
 
 
 class DspySchemaGuesserSignature(dspy.Signature):
@@ -105,8 +177,8 @@ class DspyRuleSignature(dspy.Signature):
             "Use the exact argument names from the function signature in available_functions — do not invent synonyms (e.g. regex_match takes 'regex', not 'pattern'). "
             "Include every required parameter for that function in check arguments (per its signature); filter does not substitute for missing arguments (e.g. regex_match still requires 'column' even when a filter mentions that column). "
             "When using sql_query, set input_placeholder in arguments (default input_view). In the query, use double curly braces around that value, e.g. input_placeholder=orders yields FROM {{ orders }}. The placeholder name in {{ }} must match the input_placeholder argument value. "
-            "Format: [{\"criticality\":\"error\",\"check\":{\"function\":\"name\",\"arguments\":{\"column\":\"col\"}},\"filter\":\"expression\"}] "
-            "Example: [{\"criticality\":\"error\",\"check\":{\"function\":\"is_not_null\",\"arguments\":{\"column\":\"customer_id\"}},\"filter\":\"customer_name is not null\"}]"
+            'Format: [{"criticality":"error","check":{"function":"name","arguments":{"column":"col"}},"filter":"expression"}] '
+            'Example: [{"criticality":"error","check":{"function":"is_not_null","arguments":{"column":"customer_id"}},"filter":"customer_name is not null"}]'
         )
     )
     reasoning: str = dspy.OutputField(desc="Explanation of why these rules were chosen")
@@ -141,13 +213,15 @@ class DspyRuleGeneration(dspy.Module):
             schema_info=schema_info, business_description=business_description, available_functions=available_functions
         )
 
-        # Validate JSON output
+        # Validate JSON output and filter unsafe sql_query rules
         if result.quality_rules:
             try:
-                json.loads(result.quality_rules)
+                parsed = extract_json_rules(result.quality_rules)
             except json.JSONDecodeError as e:
                 logger.warning(f"Generated invalid JSON: {e}. Returning empty rules.")
                 result.quality_rules = "[]"
+            else:
+                result.quality_rules = json.dumps(_filter_unsafe_sql_rules(parsed))
 
         return result
 
@@ -233,8 +307,8 @@ class DspyRuleUsingDataStatsSignature(dspy.Signature):
             "Use the exact argument names from the function signature in available_functions — do not invent synonyms (e.g. regex_match takes 'regex', not 'pattern'). "
             "Include every required parameter for that function in check arguments (per its signature); filter does not substitute for missing arguments (e.g. regex_match still requires 'column' even when a filter mentions that column). "
             "When using sql_query, set input_placeholder in arguments (default input_view). In the query, use double curly braces around that value, e.g. input_placeholder=orders yields FROM {{ orders }}. The placeholder name in {{ }} must match the input_placeholder argument value. "
-            "Format: [{\"criticality\":\"error\",\"check\":{\"function\":\"name\",\"arguments\":{\"column\":\"col\"}},\"filter\":\"expression\"}] "
-            "Example: [{\"criticality\":\"error\",\"check\":{\"function\":\"is_not_null\",\"arguments\":{\"column\":\"customer_id\"}},\"filter\":\"customer_name is not null\"}]"
+            'Format: [{"criticality":"error","check":{"function":"name","arguments":{"column":"col"}},"filter":"expression"}] '
+            'Example: [{"criticality":"error","check":{"function":"is_not_null","arguments":{"column":"customer_id"}},"filter":"customer_name is not null"}]'
         )
     )
     reasoning: str = dspy.OutputField(desc="Explanation of why these rules were chosen")
@@ -269,13 +343,15 @@ class DspyRuleUsingDataStats(dspy.Module):
             business_description=business_description or "",
         )
 
-        # Validate JSON output
+        # Validate JSON output and filter unsafe sql_query rules
         if result.quality_rules:
             try:
-                json.loads(result.quality_rules)
+                parsed = extract_json_rules(result.quality_rules)
             except json.JSONDecodeError as e:
                 logger.warning(f"Generated invalid JSON: {e}. Returning empty rules.")
                 result.quality_rules = "[]"
+            else:
+                result.quality_rules = json.dumps(_filter_unsafe_sql_rules(parsed))
 
         return result
 

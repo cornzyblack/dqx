@@ -42,6 +42,11 @@ test_rules = [
         description="Real min/max values were used",
         parameters={"min": Decimal("0.01"), "max": Decimal("999.99")},
     ),
+    DQProfile(
+        name="has_no_outliers",
+        column="price",
+        description="Price has no outliers",
+    ),
 ]
 
 
@@ -57,7 +62,7 @@ def test_generate_dq_rules(ws, spark):
         {
             "check": {
                 "function": "is_in_list",
-                "arguments": {"column": "vendor_id", "allowed": ["1", "4", "2"]},
+                "arguments": {"column": "vendor_id", "allowed": ["'1'", "'4'", "'2'"]},
             },
             "name": "vendor_id_other_value",
             "criticality": "error",
@@ -108,6 +113,14 @@ def test_generate_dq_rules(ws, spark):
                 "arguments": {"column": "price", "min_limit": Decimal("0.01"), "max_limit": Decimal("999.99")},
             },
             "name": "price_isnt_in_range",
+            "criticality": "error",
+        },
+        {
+            "check": {
+                "function": "has_no_outliers",
+                "arguments": {"column": "price"},
+            },
+            "name": "price_has_no_outliers",
             "criticality": "error",
         },
     ]
@@ -126,7 +139,7 @@ def test_generate_dq_rules_warn(ws, spark):
         {
             "check": {
                 "function": "is_in_list",
-                "arguments": {"column": "vendor_id", "allowed": ["1", "4", "2"]},
+                "arguments": {"column": "vendor_id", "allowed": ["'1'", "'4'", "'2'"]},
             },
             "name": "vendor_id_other_value",
             "criticality": "warn",
@@ -177,6 +190,14 @@ def test_generate_dq_rules_warn(ws, spark):
                 "arguments": {"column": "price", "min_limit": Decimal("0.01"), "max_limit": Decimal("999.99")},
             },
             "name": "price_isnt_in_range",
+            "criticality": "warn",
+        },
+        {
+            "check": {
+                "function": "has_no_outliers",
+                "arguments": {"column": "price"},
+            },
+            "name": "price_has_no_outliers",
             "criticality": "warn",
         },
     ]
@@ -250,6 +271,7 @@ def test_generate_dq_rules_dataframe_filter(ws, spark):
             description=None,
         ),
         DQProfile(name="is_not_null_or_empty", column="vendor_id", parameters={"trim_strings": True}),
+        DQProfile(name="has_no_outliers", column="price"),
     ]
     expectations = generator.generate_dq_rules(test_rules_filter)
 
@@ -261,7 +283,7 @@ def test_generate_dq_rules_dataframe_filter(ws, spark):
             "criticality": "error",
         },
         {
-            "check": {"function": "is_in_list", "arguments": {"allowed": ["1", "4", "2"], "column": "vendor_id"}},
+            "check": {"function": "is_in_list", "arguments": {"allowed": ["'1'", "'4'", "'2'"], "column": "vendor_id"}},
             "filter": "machine_id IN ('MCH-002', 'MCH-003') AND maintenance_type = 'preventive'",
             "criticality": "error",
             "name": "vendor_id_other_value",
@@ -287,6 +309,14 @@ def test_generate_dq_rules_dataframe_filter(ws, spark):
                 "arguments": {"column": "vendor_id", "trim_strings": True},
             },
             "name": "vendor_id_is_null_or_empty",
+            "criticality": "error",
+        },
+        {
+            "check": {
+                "function": "has_no_outliers",
+                "arguments": {"column": "price"},
+            },
+            "name": "price_has_no_outliers",
             "criticality": "error",
         },
     ]
@@ -315,6 +345,7 @@ def test_generate_dq_rules_dataframe_filter_none(ws, spark):
             filter=None,
         ),
         DQProfile(name="is_not_null_or_empty", column="vendor_id", parameters={"trim_strings": True}, filter=None),
+        DQProfile(name="has_no_outliers", column="price"),
     ]
     expectations = generator.generate_dq_rules(test_rules_no_filter)
 
@@ -325,7 +356,7 @@ def test_generate_dq_rules_dataframe_filter_none(ws, spark):
             "criticality": "error",
         },
         {
-            "check": {"function": "is_in_list", "arguments": {"allowed": ["1", "4", "2"], "column": "vendor_id"}},
+            "check": {"function": "is_in_list", "arguments": {"allowed": ["'1'", "'4'", "'2'"], "column": "vendor_id"}},
             "criticality": "error",
             "name": "vendor_id_other_value",
         },
@@ -340,6 +371,14 @@ def test_generate_dq_rules_dataframe_filter_none(ws, spark):
                 "arguments": {"column": "vendor_id", "trim_strings": True},
             },
             "name": "vendor_id_is_null_or_empty",
+            "criticality": "error",
+        },
+        {
+            "check": {
+                "function": "has_no_outliers",
+                "arguments": {"column": "price"},
+            },
+            "name": "price_has_no_outliers",
             "criticality": "error",
         },
     ]

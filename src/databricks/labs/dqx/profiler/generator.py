@@ -8,12 +8,14 @@ from pyspark.sql import SparkSession
 
 from databricks.sdk import WorkspaceClient
 from databricks.labs.dqx.base import DQEngineBase
-from databricks.labs.dqx.config import LLMModelConfig, InputConfig
+from databricks.labs.dqx.config import LLMModelConfig, InputConfig, TABLE_PATTERN, UC_TABLE_PATTERN
 from databricks.labs.dqx.engine import DQEngine
-from databricks.labs.dqx.profiler.common import val_maybe_to_str
+from databricks.labs.dqx.io import STORAGE_PATH_PATTERN
+from databricks.labs.dqx.profiler.common import val_maybe_to_str, val_to_str
 from databricks.labs.dqx.profiler.profiler import DQProfile
 from databricks.labs.dqx.telemetry import telemetry_logger
-from databricks.labs.dqx.errors import MissingParameterError
+from databricks.labs.dqx.errors import InvalidConfigError, MissingParameterError
+from databricks.labs.dqx.utils import get_table_column_metadata, sanitize_for_logging
 
 # Conditional imports for LLM-assisted rules generation
 try:
@@ -51,21 +53,35 @@ class DQGenerator(DQEngineBase):
 
         Args:
             workspace_client: Databricks WorkspaceClient instance.
-            spark: Optional SparkSession instance. If not provided, a new session will be created.
+            spark: Optional SparkSession instance. Required to infer the schema of inputs given
+                as a storage path; Unity Catalog tables are read through the workspace client. If
+                needed and not provided, a new session will be created on first use.
             llm_model_config: Optional LLM model configuration for AI-assisted rule generation.
             custom_check_functions: Optional dictionary of custom check functions.
         """
         super().__init__(workspace_client=workspace_client)
-        self.spark = SparkSession.builder.getOrCreate() if spark is None else spark
+        self._spark = spark
 
         self.custom_check_functions = custom_check_functions
 
         llm_model_config = llm_model_config or LLMModelConfig()
         self.llm_engine = (
-            DQLLMEngine(model_config=llm_model_config, spark=self.spark, custom_check_functions=custom_check_functions)
+            DQLLMEngine(model_config=llm_model_config, custom_check_functions=custom_check_functions)
             if LLM_ENABLED
             else None
         )
+
+    @property
+    def spark(self) -> SparkSession:
+        """
+        Gets a Spark session. Gets an available one or creates a new one if none was provided.
+
+        Returns:
+            Spark session instance.
+        """
+        if self._spark is None:
+            self._spark = SparkSession.builder.getOrCreate()
+        return self._spark
 
     @telemetry_logger("generator", "generate_dq_rules")
     def generate_dq_rules(self, profiles: list[DQProfile] | None = None, criticality: str = "error") -> list[dict]:
@@ -123,6 +139,11 @@ class DQGenerator(DQEngineBase):
 
         Raises:
             MissingParameterError: If DSPy compiler is not available.
+
+        Note:
+            A Spark session is required when using this method with an *input_config* that is not a Unity Catalog
+            table (e.g. files or temporary views). Schemas can be read without a Spark Session for tables with a
+            valid 3-level name (e.g. catalog.schema.table).
         """
         if self.llm_engine is None:
             raise MissingParameterError(
@@ -135,7 +156,7 @@ class DQGenerator(DQEngineBase):
             )
 
         logger.info(f"Generating DQ rules with LLM for input: '{user_input}'")
-        schema_info = get_column_metadata(self.spark, input_config) if input_config else ""
+        schema_info = self._get_schema_info(input_config) if input_config else ""
 
         # Generate rules using pre-initialized LLM compiler
         prediction = self.llm_engine.detect_business_rules_with_llm(
@@ -157,6 +178,40 @@ class DQGenerator(DQEngineBase):
             f"out of {len(raw_rules)} LLM output(s)."
         )
         return dq_rules
+
+    def _get_schema_info(self, input_config: InputConfig) -> str:
+        """
+        Gets the input schema as JSON for use as LLM context.
+
+        The input location determines how the schema is read:
+        * Unity Catalog tables with a 3-level namespace are read using a Databricks workspace client.
+        * Storage paths and 2-level (Hive Metastore) table names are read using a Spark session.
+
+        Args:
+            input_config: Input config providing the input data location.
+
+        Returns:
+            A JSON string containing the column metadata with columns wrapped in a "columns" key.
+
+        Raises:
+            InvalidConfigError: If the input location is neither a table name nor a storage path.
+        """
+        location = input_config.location
+        if not location:
+            raise InvalidConfigError("Input location not configured")
+
+        if UC_TABLE_PATTERN.match(location):
+            logger.info(f"Using WorkspaceClient to determine the schema info for '{sanitize_for_logging(location)}'")
+            return get_table_column_metadata(self.ws, location)
+
+        if TABLE_PATTERN.match(location) or STORAGE_PATH_PATTERN.match(location):
+            logger.info(f"Using a SparkSession to determine the schema info for '{sanitize_for_logging(location)}'")
+            return get_column_metadata(self.spark, input_config)
+
+        raise InvalidConfigError(
+            "Invalid input location. It must be a 2 or 3-level table namespace or storage path, "
+            f"given {sanitize_for_logging(location)}"
+        )
 
     def _filter_valid_rules(self, rules: list[dict]) -> list[dict]:
         """Return only rules that pass ``DQEngine.validate_checks``.
@@ -259,8 +314,12 @@ class DQGenerator(DQEngineBase):
         Returns:
                 A dictionary representing the data quality rule.
         """
+        # is_in_list resolves bare strings as column expressions, so string values must be quoted
+        # to be compared as string literals. Non-string values (numbers, dates) are passed through
+        # unchanged and resolved as literals. See _get_limit_exprs / get_limit_expr in check_funcs.
+        allowed = [val_to_str(value) if isinstance(value, str) else value for value in params["in"]]
         return {
-            "check": {"function": "is_in_list", "arguments": {"column": column, "allowed": params["in"]}},
+            "check": {"function": "is_in_list", "arguments": {"column": column, "allowed": allowed}},
             "name": f"{column}_other_value",
             "criticality": criticality,
         }
@@ -443,6 +502,31 @@ class DQGenerator(DQEngineBase):
             "user_metadata": user_metadata,
         }
 
+    @staticmethod
+    def dq_generate_has_no_outliers(column: str, criticality: str = "error", **params: dict):
+        """Generates a data quality rule to check if a column's values contain no outliers.
+
+        Uses the MAD (Median Absolute Deviation) method via the *has_no_outliers* check function.
+        Values outside median ± 3.5 * MAD are flagged as outliers.
+
+        Args:
+            column: The name of the column to check.
+            criticality: The criticality of the rule as "warn" or "error" (default is "error").
+            params: Additional parameters (unused; left for compatibility with other functions).
+
+        Returns:
+            A dictionary representing the data quality rule.
+        """
+        params = params or {}  # consume the shared **params dispatch arg (see _checks_mapping call site)
+        return {
+            "check": {
+                "function": "has_no_outliers",
+                "arguments": {"column": column},
+            },
+            "name": f"{column}_has_no_outliers",
+            "criticality": criticality,
+        }
+
     _checks_mapping = {
         "is_not_null": dq_generate_is_not_null,
         "is_in": dq_generate_is_in,
@@ -450,4 +534,5 @@ class DQGenerator(DQEngineBase):
         "is_not_null_or_empty": dq_generate_is_not_null_or_empty,
         "is_not_empty": dq_generate_is_not_empty,
         "is_unique": dq_generate_is_unique,
+        "has_no_outliers": dq_generate_has_no_outliers,
     }
